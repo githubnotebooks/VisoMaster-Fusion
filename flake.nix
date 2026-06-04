@@ -232,25 +232,25 @@
 
             # 媒体库
             mediaLibs = with pkgs; [
-              # (opencv.override {
-              #   enableGtk2 = true;
-              #   enableGtk3 = true;
-              #   enableFfmpeg = true;
-              #   enablePython = false;
-              #   enableContrib = true;
-              # })
-              # stb
-              # flac
-              # ffmpeg_7-full
-              # dav1d
-              # libaom
-              # libglibutil
+              stb
+              (opencv.override {
+                enableFfmpeg = true;
+                enablePython = false;
+                enableContrib = true;
+              })
+              ffmpeg_7-full
               fontconfig
               freetype
+              dav1d
+              libaom
+              libglibutil
+              flac
             ];
 
             pythonEnv = with pkgs; [
               v2511.python312
+              v2511.python312Packages.uv
+              v2511.python312Packages.opencv4Full
             ];
           };
 
@@ -262,13 +262,13 @@
             pkgSets.waylandLibs
             pkgSets.xorgLibs
             pkgSets.mediaLibs
+            # pkgSets.gtkLibs
             # pkgSets.buildTools
             # pkgSets.compilers
             # pkgSets.cppLibs
             # pkgSets.cudaLibs
             # pkgSets.sdlLibs
             # pkgSets.qtLibs
-            # pkgSets.gtkLibs
           ];
 
         in
@@ -285,7 +285,8 @@
             shellHook = ''
               # NVIDIA 驱动库（PyTorch 需要 libcuda.so.1）
               export LD_LIBRARY_PATH=/run/opengl-driver/lib:$LD_LIBRARY_PATH
-              conda-shell -c "conda activate visomaster; fish"
+              # 添加系统 opencv4Full 到 PYTHONPATH（优先于 venv，有 AV1 支持）
+              export PYTHONPATH=${pkgs.v2511.python312Packages.opencv4Full}/lib/python3.12/site-packages:$PYTHONPATH
             '';
 
             env.LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath allLibraries;
