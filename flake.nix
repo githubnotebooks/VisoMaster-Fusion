@@ -2,7 +2,7 @@
   description = "A basic Nix flake providing development shells";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
     nixpkgs-stable.follows = "nixpkgs";
     nixpkgs-unstable.url = "github:nixos/nixpkgs?ref=nixos-unstable";
     nixpkgs-v2511.url = "github:NixOS/nixpkgs/nixos-25.11";
@@ -147,34 +147,10 @@
             graphicsLibs = with pkgs; [
               assimp
               eigen
-              ffmpeg_7
-              freetype
               glew
               glfw
               glm
               libGL
-              libX11
-              libXrandr
-              libXinerama
-              libXi
-              libXxf86vm
-              libXcursor
-              libxkbcommon
-              xorgproto
-              libxcb
-              libXext
-              libXfixes
-              libXrender
-              libXcomposite
-              libXdamage
-              libXres
-              (opencv.override {
-                enableGtk2 = true;
-                enableGtk3 = true;
-                enableFfmpeg = true;
-                enablePython = false;
-                enableContrib = true;
-              })
             ];
 
             # Wayland 库（Qt wayland 后端需要）
@@ -183,6 +159,24 @@
               wayland-protocols
               libdrm
               wayland-scanner
+            ];
+
+            xorgLibs = with pkgs; [
+              xorg.libX11
+              xorg.libXrandr
+              xorg.libXinerama
+              xorg.libXi
+              xorg.libXxf86vm
+              xorg.libXcursor
+              libxkbcommon
+              xorg.xorgproto
+              xorg.libxcb
+              xorg.libXext
+              xorg.libXfixes
+              xorg.libXrender
+              xorg.libXcomposite
+              xorg.libXdamage
+              xorg.libXres
             ];
 
             # CUDA 运行时库（PyTorch CUDA 需要）
@@ -238,43 +232,49 @@
 
             # 媒体库
             mediaLibs = with pkgs; [
-              stb
-              flac
-              ffmpeg_7-full
+              # (opencv.override {
+              #   enableGtk2 = true;
+              #   enableGtk3 = true;
+              #   enableFfmpeg = true;
+              #   enablePython = false;
+              #   enableContrib = true;
+              # })
+              # stb
+              # flac
+              # ffmpeg_7-full
+              # dav1d
+              # libaom
+              # libglibutil
               fontconfig
-              libglibutil
+              freetype
             ];
 
-            # Python 环境（不需要导出 LD_LIBRARY_PATH）
             pythonEnv = with pkgs; [
-              v2505.python312
-              v2505.python312Packages.uv
-              v2505.python312Packages.conda
-              v2505.python312Packages.python-ffmpeg
+              v2511.python312
             ];
           };
 
           pkgSets = withPkgs pkgs;
 
-          # 所有需要导出 lib 路径的包
           allLibraries = pkgs.lib.flatten [
             pkgSets.systemLibs
-            pkgSets.buildTools
-            pkgSets.compilers
-            pkgSets.cppLibs
             pkgSets.graphicsLibs
             pkgSets.waylandLibs
-            pkgSets.cudaLibs
-            pkgSets.sdlLibs
-            pkgSets.qtLibs
-            pkgSets.gtkLibs
+            pkgSets.xorgLibs
             pkgSets.mediaLibs
+            # pkgSets.buildTools
+            # pkgSets.compilers
+            # pkgSets.cppLibs
+            # pkgSets.cudaLibs
+            # pkgSets.sdlLibs
+            # pkgSets.qtLibs
+            # pkgSets.gtkLibs
           ];
 
         in
         {
           default = pkgs.mkShellNoCC {
-            name = "visomaster";
+            name = "base";
             hardeningDisable = [ "fortify" ];
 
             packages = pkgs.lib.flatten [
@@ -283,17 +283,9 @@
             ];
 
             shellHook = ''
-              export SSL_CERT_FILE="${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-              export SSL_CERT_DIR="${pkgs.cacert}/etc/ssl/certs"
-              export REQUESTS_CA_BUNDLE="${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-
-              # CUDA 相关环境变量
-              export CUDA_HOME=${pkgs.cudaPackages_12.cuda_cudart}
-              export CUDA_PATH=$CUDA_HOME
-              export PATH=$CUDA_HOME/bin:$PATH
-
               # NVIDIA 驱动库（PyTorch 需要 libcuda.so.1）
               export LD_LIBRARY_PATH=/run/opengl-driver/lib:$LD_LIBRARY_PATH
+              conda-shell -c "conda activate visomaster; fish"
             '';
 
             env.LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath allLibraries;
