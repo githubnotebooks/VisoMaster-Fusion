@@ -8,6 +8,7 @@ from PySide6 import QtWidgets, QtCore, QtGui
 from app.ui.widgets import widget_components
 from app.ui.widgets.settings_layout_data import SETTINGS_LAYOUT_DATA
 from app.ui.widgets.common_layout_data import COMMON_LAYOUT_DATA
+from app.ui.widgets.denoiser_layout_data import DENOISER_LAYOUT_DATA
 import app.helpers.miscellaneous as misc_helpers
 from app.helpers.miscellaneous import get_video_rotation
 from app.helpers.typing_helper import ControlTypes
@@ -17,7 +18,7 @@ if TYPE_CHECKING:
 
 # PERF-01: Module-level constant built once from layout data, reused in set_control_widgets_values
 _ALL_CONTROL_WIDGET_OPTIONS: dict = {}
-for _layout_source in [SETTINGS_LAYOUT_DATA, COMMON_LAYOUT_DATA]:
+for _layout_source in [SETTINGS_LAYOUT_DATA, COMMON_LAYOUT_DATA, DENOISER_LAYOUT_DATA]:
     for _group_data in _layout_source.values():
         for _widget_key, _widget_data in _group_data.items():
             _ALL_CONTROL_WIDGET_OPTIONS[_widget_key] = _widget_data
@@ -75,8 +76,9 @@ def update_control(
     current_position = main_window.videoSeekSlider.value()
 
     # Update marker control too
-    # Do not update values of control with exec_function (like max threads count) as it would slow down the app heavily
-    if main_window.markers.get(current_position) and not exec_function:
+    # FIX: We MUST update the dictionary value regardless of the exec_function,
+    # otherwise marker data becomes stale and reverts user changes on seek.
+    if main_window.markers.get(current_position):
         main_window.markers[current_position]["control"][control_name] = control_value
 
     if exec_function:
@@ -85,10 +87,11 @@ def update_control(
             # By default an exec function definition should have atleast one parameter : MainWindow
             exec_function_args = [main_window, control_value] + exec_function_args
             exec_function(*exec_function_args)
+
     main_window.control[control_name] = control_value
+
     # Also update the feeder's state if it's running
     # BUG-16 / THREAD-03: feeder_control None check moved inside the lock to prevent TOCTOU race
-    main_window.control[control_name] = control_value
     if hasattr(main_window, "video_processor") and main_window.video_processor:
         # --- DIRTY FLAG ---
         main_window.video_processor.ui_state_is_dirty = True
@@ -100,6 +103,7 @@ def update_control(
                 cast(ControlTypes, main_window.video_processor.feeder_control)[
                     control_name
                 ] = control_value
+
     refresh_frame(main_window)
 
 

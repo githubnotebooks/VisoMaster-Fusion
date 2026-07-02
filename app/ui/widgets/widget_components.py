@@ -96,11 +96,14 @@ class TwoLineElidedLabel(QtWidgets.QLabel):
 
 class CardButton(QPushButton):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args)
-        self.main_window: "MainWindow" = kwargs.get("main_window", False)
+        self.main_window = kwargs.pop("main_window", None)
+        super().__init__(*args, **kwargs)
+        self.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.setAutoDefault(False)
+        self.setDefault(False)
         self.list_item = None
-        self.list_widget: QtWidgets.QListWidget = None
-        self.popMenu: QtWidgets.QMenu | None = None
+        self.list_widget = None
+        self.popMenu = None
 
     def _release_context_menu(self, *action_attrs: str) -> None:
         for attr in action_attrs:

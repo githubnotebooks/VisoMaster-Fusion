@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING, Dict
 
 import torch
 import threading
+import cv2
 import numpy as np
 from torchvision import transforms
 from torchvision.transforms import v2
@@ -330,17 +331,20 @@ class FaceMasks:
         y_o_full, x_o_full = torch.where(mouth_orig)
         y_s_full, x_s_full = torch.where(mouth_swap)
 
-        # 1. SCALE (Width Standard Deviation)
-        # Width is calculated based on spatial dispersion. Even if the mask jitters,
-        # the scale factor will remain completely stable over time.
         std_x_o = x_o_full.float().std()
         std_x_s = x_s_full.float().std()
+        std_y_o = y_o_full.float().std()
+        std_y_s = y_s_full.float().std()
 
         if (
             std_x_o <= 0.0
             or std_x_s <= 0.0
             or torch.isnan(std_x_o)
             or torch.isnan(std_x_s)
+            or std_y_o <= 0.0
+            or std_y_s <= 0.0
+            or torch.isnan(std_y_o)
+            or torch.isnan(std_y_s)
         ):
             return None, None
 
@@ -431,16 +435,13 @@ class FaceMasks:
         dark_cavity = torch.pow(blurred_swap_norm, cavity_gamma) * 255.0
 
         # 3. Composite the overlay
-        overlay = overlay * content_mask_blurred + dark_cavity * (
+        cavity_layer = overlay * content_mask_blurred + dark_cavity * (
             1.0 - content_mask_blurred
         )
 
         # 4. WIDEN THE MASK to catch persistent edge pixels
-        overlay_mask = self._dilate_binary(inner_swap.float(), 3, mode="conv")
-
-        dynamic_kernel = int(w_s.item() * 0.15) | 1
-        dynamic_kernel = max(5, min(31, dynamic_kernel))
-
+        overlay_mask = self._dilate_binary(content_mask, 3, mode="conv")
+        dynamic_kernel = max(5, min(31, int(w_s.item() * 0.15) | 1))
         blurred_mask = v2.functional.gaussian_blur(
             overlay_mask.unsqueeze(0),
             kernel_size=dynamic_kernel,
@@ -449,8 +450,7 @@ class FaceMasks:
 
         # Restrict strictly to inner_swap to prevent bleeding onto the swapped lips
         # 1. Allow a maximum physical expansion of exactly 2 pixels onto the lips
-        base_inner = inner_swap.float()
-        allowed_bleed_region = self._dilate_binary(base_inner, 2, mode="conv")
+        allowed_bleed_region = self._dilate_binary(content_mask, 2, mode="conv")
 
         # 2. Blur this strict boundary slightly so it acts as a smooth braking gradient
         soft_limit = v2.functional.gaussian_blur(
@@ -458,14 +458,135 @@ class FaceMasks:
         ).squeeze(0)
 
         # 3. Force the absolute inner mouth to remain strictly untouched (100% opaque)
-        soft_limit = torch.maximum(soft_limit, base_inner)
+        soft_limit = torch.maximum(soft_limit, content_mask)
 
         # 4. Multiply the final mask by this soft limit to gently but rapidly fade out any excess blur
         final_mask = blurred_mask * soft_limit
 
+        # PHASE 2: ALIGNED TONGUE OVERRIDE
+        tongue_alpha = None
+        if parameters.get("RestoreTongueToggle", True):
+            candidate_orig = ((labels_orig == 11) | (labels_orig == 13)).float()
+            candidate_orig_transformed = v2.functional.affine(
+                candidate_orig.unsqueeze(0),
+                interpolation=v2.InterpolationMode.NEAREST,
+                **affine_kwargs,
+            ).squeeze(0)
+
+            y_inner_s, _ = torch.where(inner_swap)
+            cavity_s_h = (
+                (y_inner_s.max() - y_inner_s.min()).float()
+                if len(y_inner_s) > 0
+                else 0.0
+            )
+
+            # The physical mouth hole must be open to allow a tongue
+            if (
+                len(y_s_full) > 0
+                and candidate_orig_transformed.sum() > 0
+                and cavity_s_h > 4.0
+            ):
+                y_swap_bottom = y_s_full.max().float()
+                mouth_s_w = (x_s_full.max() - x_s_full.min()).float() + 1e-5
+                mouth_s_h = (y_s_full.max() - y_s_full.min()).float() + 1e-5
+
+                # Create the Spill Zone (Below the swapped mouth + 2 pixel alignment buffer)
+                y_coords = torch.arange(
+                    candidate_orig_transformed.shape[0],
+                    device=candidate_orig_transformed.device,
+                ).view(-1, 1)
+                spill_zone_mask = (y_coords > (y_swap_bottom + 2.0)).float()
+
+                raw_spill = candidate_orig_transformed * spill_zone_mask
+                y_spill, x_spill = torch.where(raw_spill > 0.5)
+
+                # Ignore micro-noise (spill must be physically > 4 pixels deep)
+                if len(y_spill) > 10 and (y_spill.max() - y_spill.min()).float() > 4.0:
+                    spill_w = (x_spill.max() - x_spill.min()).float()
+                    spill_depth = (y_spill.max() - y_spill.min()).float()
+
+                    spill_w_ratio = spill_w / mouth_s_w
+                    spill_depth_ratio = spill_depth / mouth_s_h
+
+                    # SHAPE GUARDS
+                    is_localized = (
+                        spill_w_ratio < 0.70
+                    )  # Narrow enough to be a standard tongue
+                    is_deep = (
+                        spill_depth_ratio > 0.12
+                    )  # Deep enough to definitively be a protrusion
+                    is_massive = (
+                        spill_depth_ratio > 0.22
+                    )  # "Deep Override": So deep it physically must be a tongue, ignoring width limits
+
+                    if is_deep and (is_localized or is_massive):
+                        # Adapts dynamically to x_spill. If the tongue is narrow, the shield is narrow.
+                        # If the tongue is massive, the shield opens wide automatically.
+                        padding = int(
+                            mouth_s_w * 0.10
+                        )  # 10% padding for smooth blending
+                        x_min = max(0, x_spill.min().item() - padding)
+                        x_max = min(
+                            candidate_orig_transformed.shape[1],
+                            x_spill.max().item() + padding,
+                        )
+
+                        horizontal_mask = torch.zeros_like(candidate_orig_transformed)
+                        horizontal_mask[:, x_min:x_max] = 1.0
+
+                        tongue_base = candidate_orig_transformed * horizontal_mask
+
+                        # Shield the SWAPPED upper lip to protect lips
+                        upper_lip_swap = (labels_swap == 12).float()
+                        shield = self._dilate_binary(upper_lip_swap, 3, mode="pool")
+
+                        raw_tongue = tongue_base * (1.0 - shield)
+                        raw_tongue = self._dilate_binary(
+                            raw_tongue, -2, mode="pool"
+                        )  # Fill gaps
+
+                        # TONGUE HOLE FILLING (OpenCV Contours)
+                        tongue_np = (raw_tongue.cpu().numpy() * 255).astype(np.uint8)
+                        contours, _ = cv2.findContours(
+                            tongue_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                        )
+                        if len(contours) > 0:
+                            cv2.drawContours(
+                                tongue_np, contours, -1, 255, thickness=cv2.FILLED
+                            )
+
+                        raw_tongue = (
+                            torch.from_numpy(tongue_np).to(
+                                device=raw_tongue.device, dtype=torch.float32
+                            )
+                            / 255.0
+                        )
+
+                        # Blur blending
+                        blend_val = parameters.get("TongueBlurDecimalSlider", 0.40)
+                        if blend_val > 1.0:
+                            blend_val = blend_val / 100.0
+
+                        blur_k = max(3, min(35, int(blend_val * 50) | 1))
+
+                        tongue_alpha = v2.functional.gaussian_blur(
+                            raw_tongue.unsqueeze(0),
+                            kernel_size=blur_k,
+                            sigma=blur_k / 3.0,
+                        ).squeeze(0)
+
+        # Composite the final overlay
+        if tongue_alpha is not None:
+            overlay = overlay * tongue_alpha + cavity_layer * (1.0 - tongue_alpha)
+            final_mask = torch.maximum(final_mask, tongue_alpha)
+        else:
+            overlay = cavity_layer
+
         return overlay, final_mask
 
-    def get_mouth_overlay(self, swap_img, original_img, parameters):
+    def get_mouth_overlay(
+        self, swap_img: torch.Tensor, original_img: torch.Tensor, parameters: dict
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None] | None:
         """
         Public helper to retrieve the mouth overlay based on UI parameters.
         Routes to original mouth alignment or swapped mouth enhancement & zoom.
@@ -476,13 +597,16 @@ class FaceMasks:
         labels_swap = self._faceparser_labels(swap_img)
 
         if parameters.get("MouthParserStretchOriginalToggle", False):
-            # The user wants the ORIGINAL mouth (with Alignment and Zoom)
             labels_orig = self._faceparser_labels(original_img)
+
             return self._enhance_and_align_original_mouth(
-                original_img, swap_img, labels_orig, labels_swap, parameters
+                img_orig=original_img,
+                img_swap=swap_img,
+                labels_orig=labels_orig,
+                labels_swap=labels_swap,
+                parameters=parameters,
             )
         else:
-            # The user wants the SWAPPED mouth (with Upscale and Zoom)
             return self._enhance_and_align_swapped_mouth(
                 swap_img, labels_swap, parameters
             )
@@ -1155,10 +1279,22 @@ class FaceMasks:
         else:
             print("[ERROR] FaceParser model not found or failed to load.")
 
-    def apply_dfl_xseg(self, img, amount, mouth, parameters, inner_mouth_mask=None):
+    def apply_dfl_xseg(
+        self,
+        img: torch.Tensor,
+        amount: float,
+        mouth: torch.Tensor,
+        parameters: dict,
+        inner_mouth_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        import cv2
+
         # FM-07: use .get() for all parameter accesses to avoid KeyError
         amount2 = -parameters.get("DFLXSeg2SizeSlider", 0)
         amount_calc = -parameters.get("BackgroundParserTextureSlider", 0)
+
+        # Check if obstacle protection is enabled
+        exclude_obstacles = parameters.get("XSegExcludeInnerObstaclesToggle", False)
 
         img = img.type(torch.float32)
         img = torch.div(img, 255)
@@ -1173,35 +1309,100 @@ class FaceMasks:
         outpred[outpred < 0.1] = 0
         outpred_calc = outpred.clone()
 
+        # Invert: Face becomes 0, Background/Obstacles become 1
         outpred = 1.0 - outpred
         outpred = torch.unsqueeze(outpred, 0).type(torch.float32)
-
-        outpred_calc = torch.where(outpred_calc < 0.1, 0, 1).float()
-        outpred_calc = 1.0 - outpred_calc
-        outpred_calc = torch.unsqueeze(outpred_calc, 0).type(torch.float32)
-
-        outpred_calc_dill = outpred_calc.clone()
 
         if amount2 != amount:
             outpred2 = outpred.clone()
 
+        # --- HPC OPTIMIZATION: Hybrid Smart Face Expansion ---
+        needs_smart_expand_1 = (amount < 0) and exclude_obstacles
+        needs_smart_expand_2 = (amount2 != amount and amount2 < 0) and exclude_obstacles
+
+        true_obstacles = None
+        if needs_smart_expand_1 or needs_smart_expand_2:
+            # Re-invert temporarily to find the solid face contour (Face=1)
+            face_mask = 1.0 - outpred
+
+            # HPC OPTIMIZATION: Cast to 8-bit integer BEFORE transferring over PCIe to the CPU.
+            # This reduces the VRAM-to-RAM transfer payload by 75%.
+            mask_np_uint8 = (face_mask.squeeze() * 255).to(torch.uint8).cpu().numpy()
+
+            contours, _ = cv2.findContours(
+                mask_np_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+
+            hull_mask_np = mask_np_uint8.copy()
+            if len(contours) > 0:
+                largest_contour = max(contours, key=cv2.contourArea)
+                hull = cv2.convexHull(largest_contour)
+                cv2.drawContours(hull_mask_np, [hull], -1, 255, thickness=cv2.FILLED)
+
+            # Obstacles are the gaps exactly inside the face hull
+            raw_obstacles_np = cv2.bitwise_and(
+                hull_mask_np, cv2.bitwise_not(mask_np_uint8)
+            )
+
+            # Use morphological opening to remove thin boundary slivers (1-3px)
+            kernel_morph = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            true_obstacles_np = cv2.morphologyEx(
+                raw_obstacles_np, cv2.MORPH_OPEN, kernel_morph
+            )
+
+            # HPC OPTIMIZATION: Use non_blocking=True for the return transfer to allow
+            # the CUDA stream to continue queuing operations if possible.
+            true_obstacles = (
+                torch.from_numpy(true_obstacles_np).to(
+                    device=outpred.device, dtype=torch.float32, non_blocking=True
+                )
+                / 255.0
+            )
+            true_obstacles = true_obstacles.unsqueeze(0)
+
+        # ---------- AMOUNT PROCESSING ----------
         if amount > 0:
+            # Slider is Negative -> Shrink Face (Expand Background=1)
             r = int(amount)
             k = 2 * r + 1
             outpred = F.max_pool2d(outpred, kernel_size=k, stride=1, padding=r)
-            outpred = outpred.clamp(0, 1)
+            outpred = outpred.clamp(0.0, 1.0)
 
         elif amount < 0:
+            # Slider is Positive -> Expand Face
             r = int(-amount)
             k = 2 * r + 1
-            outpred = 1 - outpred
-            outpred = F.max_pool2d(outpred, kernel_size=k, stride=1, padding=r)
-            outpred = 1 - outpred
-            outpred = outpred.clamp(0, 1)
 
+            if exclude_obstacles and true_obstacles is not None:
+                # Shield only grows at 50% of the face expansion rate.
+                shield_r = max(1, r // 2)
+                shield_k = 2 * shield_r + 1
+
+                face_mask = 1.0 - outpred
+                dilated_face = F.max_pool2d(
+                    face_mask, kernel_size=k, stride=1, padding=r
+                )
+                shield = F.max_pool2d(
+                    true_obstacles, kernel_size=shield_k, stride=1, padding=shield_r
+                )
+
+                expanded_safe = torch.clamp(dilated_face - shield, 0.0, 1.0)
+                final_face = torch.maximum(face_mask, expanded_safe)
+
+                outpred = 1.0 - final_face
+                outpred = outpred.clamp(0.0, 1.0)
+            else:
+                outpred = 1.0 - outpred
+                outpred = F.max_pool2d(outpred, kernel_size=k, stride=1, padding=r)
+                outpred = 1.0 - outpred
+                outpred = outpred.clamp(0.0, 1.0)
+
+        # Derive calculation masks AFTER size processing, but BEFORE blur.
+        # This ensures color stats never sample excluded background pixels.
+        outpred_calc = torch.where(outpred < 0.5, 0.0, 1.0).float()
+        outpred_calc_dill = outpred_calc.clone()
         blur_amount = parameters.get("OccluderXSegBlurSlider", 0)
         if blur_amount > 0:
-            # OPTIMIZED: Zero-overhead functional blur (bypasses class instantiation and dict caching)
             k_size = blur_amount * 2 + 1
             sigma = (blur_amount + 1) * 0.2
             outpred = v2.functional.gaussian_blur(
@@ -1209,20 +1410,48 @@ class FaceMasks:
             )
 
         outpred_noFP = outpred.clone()
+
+        # ---------- AMOUNT2 PROCESSING ----------
         if amount2 != amount:
             if amount2 > 0:
+                # Slider2 is Negative -> Shrink Face
                 r2 = int(amount2)
                 k2 = 2 * r2 + 1
                 outpred2 = F.max_pool2d(outpred2, kernel_size=k2, stride=1, padding=r2)
-                outpred2 = outpred2.clamp(0, 1)
+                outpred2 = outpred2.clamp(0.0, 1.0)
 
             elif amount2 < 0:
+                # Slider2 is Positive -> Expand Face
                 r2 = int(-amount2)
                 k2 = 2 * r2 + 1
-                outpred2 = 1 - outpred2
-                outpred2 = F.max_pool2d(outpred2, kernel_size=k2, stride=1, padding=r2)
-                outpred2 = 1 - outpred2
-                outpred2 = outpred2.clamp(0, 1)
+
+                if exclude_obstacles and true_obstacles is not None:
+                    shield_r2 = max(1, r2 // 2)
+                    shield_k2 = 2 * shield_r2 + 1
+
+                    face_mask2 = 1.0 - outpred2
+                    dilated_face2 = F.max_pool2d(
+                        face_mask2, kernel_size=k2, stride=1, padding=r2
+                    )
+                    shield2 = F.max_pool2d(
+                        true_obstacles,
+                        kernel_size=shield_k2,
+                        stride=1,
+                        padding=shield_r2,
+                    )
+
+                    expanded_safe2 = torch.clamp(dilated_face2 - shield2, 0.0, 1.0)
+                    final_face2 = torch.maximum(face_mask2, expanded_safe2)
+
+                    outpred2 = 1.0 - final_face2
+                    outpred2 = outpred2.clamp(0.0, 1.0)
+                else:
+                    outpred2 = 1.0 - outpred2
+                    outpred2 = F.max_pool2d(
+                        outpred2, kernel_size=k2, stride=1, padding=r2
+                    )
+                    outpred2 = 1.0 - outpred2
+                    outpred2 = outpred2.clamp(0.0, 1.0)
 
             blur_amount2 = parameters.get("XSeg2BlurSlider", 0)
             if blur_amount2 > 0:
@@ -1244,7 +1473,7 @@ class FaceMasks:
                 outpred_noFP = outpred_noFP.unsqueeze(0)
             outpred_noFP = outpred_noFP * (1.0 - inner_mouth_mask)
 
-        # FM-07: use .get() for BgExcludeEnableToggle and BGExcludeBlurAmountSlider
+        # Background exclusion
         if parameters.get("BgExcludeEnableToggle", False) and amount_calc != 0:
             if amount_calc > 0:
                 r2 = int(amount_calc)
@@ -1252,7 +1481,7 @@ class FaceMasks:
                 outpred_calc_dill = F.max_pool2d(
                     outpred_calc_dill, kernel_size=k2, stride=1, padding=r2
                 )
-                outpred_calc_dill = outpred_calc_dill.clamp(0, 1)
+                outpred_calc_dill = outpred_calc_dill.clamp(0.0, 1.0)
                 bg_blur = parameters.get("BGExcludeBlurAmountSlider", 0)
                 if bg_blur > 0:
                     k_bg = bg_blur * 2 + 1
@@ -1262,15 +1491,15 @@ class FaceMasks:
                         [k_bg, k_bg],
                         [s_bg, s_bg],
                     )
-                outpred_calc_dill = outpred_calc_dill.clamp(0, 1)
+                outpred_calc_dill = outpred_calc_dill.clamp(0.0, 1.0)
             elif amount_calc < 0:
                 r2 = int(-amount_calc)
                 k2 = 2 * r2 + 1
-                outpred_calc_dill = 1 - outpred_calc_dill
+                outpred_calc_dill = 1.0 - outpred_calc_dill
                 outpred_calc_dill = F.max_pool2d(
                     outpred_calc_dill, kernel_size=k2, stride=1, padding=r2
                 )
-                outpred_calc_dill = 1 - outpred_calc_dill
+                outpred_calc_dill = 1.0 - outpred_calc_dill
                 bg_blur = parameters.get("BGExcludeBlurAmountSlider", 0)
                 if bg_blur > 0:
                     orig = outpred_calc_dill.clone()
@@ -1282,7 +1511,8 @@ class FaceMasks:
                         [s_bg, s_bg],
                     )
                     outpred_calc_dill = torch.max(outpred_calc_dill, orig)
-                outpred_calc_dill = outpred_calc_dill.clamp(0, 1)
+                outpred_calc_dill = outpred_calc_dill.clamp(0.0, 1.0)
+
         return outpred, outpred_calc, outpred_calc_dill, outpred_noFP
 
     def run_dfl_xseg(self, image, output):

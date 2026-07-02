@@ -490,19 +490,23 @@ class FrameWorker(threading.Thread):
             traceback.print_exc()
             # Emit the original (unprocessed) frame as a fallback so the recording
             # metronome is never blocked waiting for a frame that will never arrive.
-            # Only do this for pool/video mode — single-frame and webcam have their
-            # own error recovery paths.
+            # Only do this for pool/video mode AND webcam mode — single-frame has its
+            # own error recovery path.
             if (
                 not self.stop_event.is_set()
                 and not self.is_single_frame
-                and self.video_processor.file_type != "webcam"
                 and isinstance(_fallback_frame_rgb, np.ndarray)
             ):
                 try:
                     fallback_bgr = np.ascontiguousarray(_fallback_frame_rgb[..., ::-1])
-                    self.video_processor.frame_processed_signal.emit(
-                        self.frame_number, fallback_bgr
-                    )
+                    if self.video_processor.file_type == "webcam":
+                        self.video_processor.webcam_frame_processed_signal.emit(
+                            fallback_bgr
+                        )
+                    else:
+                        self.video_processor.frame_processed_signal.emit(
+                            self.frame_number, fallback_bgr
+                        )
                 except Exception as fb_err:
                     print(
                         f"[WARN] Fallback emit also failed for frame "
@@ -2994,53 +2998,73 @@ class FrameWorker(threading.Thread):
         source_latent: torch.Tensor, target_latent: torch.Tensor, params: dict
     ) -> torch.Tensor:
         """FW-QUAL-09: Identity Boost (Face Likeness) via SLERP / LERP on ArcFace embeddings.
-
-        Promoted from inner function to @staticmethod so it is reusable and not
-        re-created on every call to get_affined_face_dim_and_swapping_latents.
+        Now includes Latent Overdrive (Magnitude Scaling) via FaceLikenessStrengthDecimalSlider
+        to increase identity strength without geometric warping.
         """
         if not params.get("FaceLikenessEnableToggle", False):
             return source_latent
 
-        factor = float(params.get("FaceLikenessFactorDecimalSlider", 0.0))
-        if factor == 0.0:
+        factor: float = float(params.get("FaceLikenessFactorDecimalSlider", 0.0))
+
+        # Extract the new volume multiplier. Default to 1.0 (baseline energy) if missing.
+        strength_multiplier: float = float(
+            params.get("FaceLikenessStrengthDecimalSlider", 1.0)
+        )
+
+        # Early return only if both sliders are at their passive baseline
+        if factor == 0.0 and strength_multiplier == 1.0:
             return source_latent
 
         # 1. Capture original energy (Norms are generally constant in ArcFace)
-        s_norm = torch.norm(source_latent)
-        t_norm = torch.norm(target_latent)
+        s_norm: torch.Tensor = torch.norm(source_latent)
+        t_norm: torch.Tensor = torch.norm(target_latent)
 
         if s_norm < 1e-6 or t_norm < 1e-6:
             return source_latent
 
         # 2. Normalize to get directional vectors on the hypersphere
-        s_dir = source_latent / s_norm
-        t_dir = target_latent / t_norm
+        s_dir: torch.Tensor = source_latent / s_norm
+        t_dir: torch.Tensor = target_latent / t_norm
+
+        # Declare the variable once for mypy inference
+        blended_dir: torch.Tensor
 
         if factor < 0.0:
             # --- INTERPOLATION (SLERP) ---
             # Move naturally towards the target face along the sphere
-            t = 1.0 + factor
+            t: float = 1.0 + factor
 
-            cos_theta = torch.sum(s_dir * t_dir)
+            cos_theta: torch.Tensor = torch.sum(s_dir * t_dir)
             cos_theta = torch.clamp(cos_theta, -0.9999, 0.9999)
-            theta = torch.acos(cos_theta)
-            sin_theta = torch.sin(theta)
+            theta: torch.Tensor = torch.acos(cos_theta)
+            sin_theta: torch.Tensor = torch.sin(theta)
 
             if sin_theta < 1e-3:
+                # Removed redundant type hint here
                 blended_dir = (1.0 - t) * t_dir + t * s_dir
             else:
-                weight_t = torch.sin((1.0 - t) * theta) / sin_theta
-                weight_s = torch.sin(t * theta) / sin_theta
+                weight_t: torch.Tensor = torch.sin((1.0 - t) * theta) / sin_theta
+                weight_s: torch.Tensor = torch.sin(t * theta) / sin_theta
+                # Removed redundant type hint here
                 blended_dir = weight_t * t_dir + weight_s * s_dir
-        else:
+
+        elif factor > 0.0:
             # --- EXTRAPOLATION (LERP) ---
             # Push the vector away from the target to exaggerate the source identity
-            difference_vector = s_dir - t_dir
+            difference_vector: torch.Tensor = s_dir - t_dir
+            # Removed redundant type hint here
             blended_dir = s_dir + (factor * difference_vector)
 
-        # 3. Always restore original Source Energy to prevent latent space corruption
+        else:
+            # Factor is 0.0, but strength_multiplier is active. Keep original direction.
+            # Removed redundant type hint here
+            blended_dir = s_dir
+
+        # 3. Apply Directional Normalization and Latent Overdrive (Volume)
         blended_dir = blended_dir / torch.norm(blended_dir)
-        final_latent = blended_dir * s_norm
+
+        # Multiply the original source energy by the new slider's volume
+        final_latent: torch.Tensor = blended_dir * (s_norm * strength_multiplier)
 
         return final_latent
 
@@ -3260,107 +3284,159 @@ class FrameWorker(threading.Thread):
     def _fix_drift_and_texture(
         self,
         current_face: torch.Tensor,
-        prev_face: torch.Tensor,
         first_face: torch.Tensor,
-        blend_texture: bool = True,
     ) -> torch.Tensor:
         """
-        Corrects spatial drift via Phase Correlation and restores skin textures
-        (high frequency) to prevent the plastic effect from multiple iterations.
-        Includes an improved LAB-space Adaptive Instance Normalization (AdaIN)
-        to lock color and contrast without destroying white balance.
-        Expected tensors in [C, H, W] format as Floats (0.0 - 1.0).
+        Corrects spatial warping and restores skin texture without ghosting.
+
+        OPTIMIZED:
+        1. Thread-safe grid caching to prevent CUDA memory fragmentation.
+        2. Masked LAB AdaIN to prevent background color pollution.
+        3. Hardcoded 5.0 pixel limit (tuned for 512x512) for micro-jitter correction.
+
+        Args:
+            current_face:  Current swapped face tensor [C, H, W] in range [0..1].
+            first_face:    The uncorrupted first pass tensor [C, H, W].
+
+        Returns:
+            Corrected CHW float32 tensor in range [0..1].
         """
+        if first_face is None:
+            return current_face
+
         device = current_face.device
+        C, H, W = current_face.shape
 
-        # --- 1. ANTI-DRIFT (Phase Correlation FFT) ---
-        anchor_face = first_face if first_face is not None else prev_face
+        # Initialize thread-safe cache for grids if it doesn't exist on this worker instance
+        if not hasattr(self, "_drift_cache"):
+            self._drift_cache: dict[tuple[int, int, str], dict[str, torch.Tensor]] = {}
 
-        gray_curr = current_face.mean(dim=0, keepdim=True)
-        gray_anchor = anchor_face.mean(dim=0, keepdim=True)
+        cache_key = (H, W, str(device))
 
-        H, W = gray_curr.shape[1], gray_curr.shape[2]
+        with torch.no_grad():
+            curr_bchw = current_face.unsqueeze(0)
+            first_bchw = first_face.unsqueeze(0)
 
-        gray_curr_blurred = self._DRIFT_TEXTURE_BLUR(gray_curr)
-        gray_anchor_blurred = self._DRIFT_TEXTURE_BLUR(gray_anchor)
+            # --- 0. CACHE RETRIEVAL FOR ZERO-ALLOCATION GRIDS ---
+            if cache_key not in self._drift_cache:
+                y_coords = torch.arange(H, dtype=torch.float32, device=device)
+                x_coords = torch.arange(W, dtype=torch.float32, device=device)
+                Y_pix, X_pix = torch.meshgrid(y_coords, x_coords, indexing="ij")
 
-        window_y = torch.hann_window(H, device=device).view(H, 1)
-        window_x = torch.hann_window(W, device=device).view(1, W)
-        window = window_y * window_x
+                Y_norm = (Y_pix - H / 2) / (H / 2)
+                X_norm = (X_pix - W / 2) / (W / 2)
 
-        G_curr = torch.fft.fft2(gray_curr_blurred * window)
-        G_anchor = torch.fft.fft2(gray_anchor_blurred * window)
+                # Core mask for Center of Mass tracking
+                dist_norm_core = torch.sqrt(X_norm**2 + (Y_norm / 1.2) ** 2)
+                core_mask = (
+                    torch.exp(-0.5 * (dist_norm_core / 0.4) ** 2)
+                    .unsqueeze(0)
+                    .unsqueeze(0)
+                )
 
-        R = G_anchor * torch.conj(G_curr)
-        R = R / (torch.abs(R) + 1e-8)
+                # Spatial mask for peripheral anchoring
+                dist_norm_spatial = torch.sqrt(X_norm**2 + (Y_norm / 0.5) ** 2)
+                spatial_mask = torch.exp(
+                    -0.5 * (dist_norm_spatial / 0.5) ** 2
+                ).unsqueeze(0)
+                spatial_mask = torch.clamp(spatial_mask, 0.0, 1.0)
 
-        r = torch.fft.ifft2(R).real
-        r = torch.fft.fftshift(r)
+                self._drift_cache[cache_key] = {
+                    "Y_pix": Y_pix,
+                    "X_pix": X_pix,
+                    "core_mask": core_mask,
+                    "spatial_mask": spatial_mask,
+                }
 
-        max_idx = r.argmax()
-        dy = (max_idx // W).item() - H // 2
-        dx = (max_idx % W).item() - W // 2
+            cache = self._drift_cache[cache_key]
+            Y_pix = cache["Y_pix"]
+            X_pix = cache["X_pix"]
+            core_mask = cache["core_mask"]
+            spatial_mask = cache["spatial_mask"]
 
-        max_drift = max(2, int(H * 0.015))
+            # --- 1. ROBUST SUB-PIXEL DRIFT CORRECTION ---
+            # Fast grayscale conversion
+            weights = torch.tensor([0.299, 0.587, 0.114], device=device).view(
+                1, 3, 1, 1
+            )
+            curr_gray = (curr_bchw * weights).sum(dim=1, keepdim=True)
+            first_gray = (first_bchw * weights).sum(dim=1, keepdim=True)
 
-        if abs(dy) <= 1 and abs(dx) <= 1:
-            dy, dx = 0, 0
-        elif abs(dy) > max_drift or abs(dx) > max_drift:
-            dy, dx = 0, 0
+            blob_blur = v2.GaussianBlur(kernel_size=51, sigma=15.0)
+            curr_blob = blob_blur(curr_gray)
+            first_blob = blob_blur(first_gray)
 
-        if dy != 0 or dx != 0:
-            current_face = torch.roll(current_face, shifts=(dy, dx), dims=(1, 2))
+            # Apply core mask to isolate face volume
+            curr_blob_masked = curr_blob * core_mask
+            first_blob_masked = first_blob * core_mask
 
-            if dy > 0:
-                current_face[:, :dy, :] = anchor_face[:, :dy, :]
-            elif dy < 0:
-                current_face[:, dy:, :] = anchor_face[:, dy:, :]
-            if dx > 0:
-                current_face[:, :, :dx] = anchor_face[:, :, :dx]
-            elif dx < 0:
-                current_face[:, :, dx:] = anchor_face[:, :, dx:]
+            curr_mass = curr_blob_masked.sum() + 1e-8
+            first_mass = first_blob_masked.sum() + 1e-8
 
-        # --- 2. TEXTURE & COLOR PRESERVATION ---
-        if blend_texture and first_face is not None:
-            # --- Improved Color & Luminance Lock (LAB AdaIN) ---
-            # Operating in LAB color space prevents the destruction of white balance
-            # and contrast that happens when normalizing RGB channels independently.
+            curr_cx = (curr_blob_masked * X_pix).sum() / curr_mass
+            curr_cy = (curr_blob_masked * Y_pix).sum() / curr_mass
 
-            # Convert to LAB (requires [B, C, H, W] shape)
-            curr_bchw = current_face.unsqueeze(0).clamp(0.0, 1.0)
-            first_bchw = first_face.unsqueeze(0).clamp(0.0, 1.0)
+            first_cx = (first_blob_masked * X_pix).sum() / first_mass
+            first_cy = (first_blob_masked * Y_pix).sum() / first_mass
 
-            curr_lab = kc.rgb_to_lab(curr_bchw)
-            first_lab = kc.rgb_to_lab(first_bchw)
+            # Strict micro-jitter clamp (resolves high-iteration identity wash-out)
+            max_drift = 5.0
+            dx = torch.clamp(first_cx - curr_cx, -max_drift, max_drift)
+            dy = torch.clamp(first_cy - curr_cy, -max_drift, max_drift)
 
-            # Calculate Mean and Std for each LAB channel independently
-            mean_curr = curr_lab.mean(dim=(2, 3), keepdim=True)
-            std_curr = curr_lab.std(dim=(2, 3), keepdim=True) + 1e-6
+            M = torch.eye(3, device=device)[:2, :].unsqueeze(0)
+            M[0, 0, 2] = dx
+            M[0, 1, 2] = dy
 
-            mean_first = first_lab.mean(dim=(2, 3), keepdim=True)
-            std_first = first_lab.std(dim=(2, 3), keepdim=True) + 1e-6
+            curr_bchw = kgm.warp_affine(
+                curr_bchw,
+                M,
+                dsize=(H, W),
+                mode="bilinear",
+                padding_mode="border",
+                align_corners=False,
+            )
+            current_face = curr_bchw.squeeze(0)
 
-            # Apply Adaptive Instance Normalization
+            # --- 2. PERIPHERAL ANCHORING ---
+            current_face = (current_face * spatial_mask) + (
+                first_face * (1.0 - spatial_mask)
+            )
+            # Blend to dampen jitter
+            current_face = (current_face * 0.85) + (first_face * 0.15)
+
+            # --- 3. COLOR & LUMINANCE LOCK (Masked LAB AdaIN) ---
+            curr_bchw_clamp = current_face.unsqueeze(0).clamp(0.0, 1.0)
+            first_bchw_clamp = first_face.unsqueeze(0).clamp(0.0, 1.0)
+
+            curr_lab = kc.rgb_to_lab(curr_bchw_clamp)
+            first_lab = kc.rgb_to_lab(first_bchw_clamp)
+
+            # Use the core mask to calculate statistics ONLY on the face, ignoring background
+            # Expand mask to match LAB channels [1, 3, H, W]
+            stat_mask = core_mask.expand_as(curr_lab)
+            mask_sum = stat_mask.sum(dim=(2, 3), keepdim=True) + 1e-8
+
+            # Masked Mean
+            mean_curr = (curr_lab * stat_mask).sum(dim=(2, 3), keepdim=True) / mask_sum
+            mean_first = (first_lab * stat_mask).sum(
+                dim=(2, 3), keepdim=True
+            ) / mask_sum
+
+            # Masked Variance / Std
+            var_curr = (((curr_lab - mean_curr) ** 2) * stat_mask).sum(
+                dim=(2, 3), keepdim=True
+            ) / mask_sum
+            var_first = (((first_lab - mean_first) ** 2) * stat_mask).sum(
+                dim=(2, 3), keepdim=True
+            ) / mask_sum
+
+            std_curr = torch.sqrt(var_curr) + 1e-6
+            std_first = torch.sqrt(var_first) + 1e-6
+
+            # Apply AdaIN
             matched_lab = (curr_lab - mean_curr) * (std_first / std_curr) + mean_first
-
-            # Convert back to RGB and remove batch dimension
-            current_face = kc.lab_to_rgb(matched_lab).squeeze(0).clamp(0.0, 1.0)
-
-            # --- Frequency Separation (Micro-details) ---
-            k = max(3, (H // 32) * 2 + 1)
-            sigma = k * 0.3
-            blur_tex = v2.GaussianBlur(kernel_size=k, sigma=sigma)
-
-            low_pass_first = blur_tex(first_face)
-            high_pass_first = first_face - low_pass_first
-
-            # Dampen the high frequencies slightly to avoid over-sharpening noise
-            high_pass_first = torch.clamp(high_pass_first, -0.3, 0.3) * 0.75
-
-            low_pass_curr = blur_tex(current_face)
-
-            # Reconstruct the image: New structural shape (low freq) + Original skin texture (high freq)
-            current_face = low_pass_curr + high_pass_first
+            current_face = kc.lab_to_rgb(matched_lab).squeeze(0)
 
         return torch.clamp(current_face, 0.0, 1.0)
 
@@ -3464,9 +3540,8 @@ class FrameWorker(threading.Thread):
                                 curr_chw.clone()
                             )  # Store first pass for drift correction
                         else:
-                            prev_chw = prev_face.permute(2, 0, 1)
                             curr_chw = self._fix_drift_and_texture(
-                                curr_chw, prev_chw, first_pass_face
+                                curr_chw, first_pass_face
                             )
                             temp_output = curr_chw.permute(1, 2, 0)
 
@@ -3514,9 +3589,8 @@ class FrameWorker(threading.Thread):
                         if k == 0:
                             first_pass_face = curr_chw.clone()
                         else:
-                            prev_chw = prev_face.permute(2, 0, 1)
                             curr_chw = self._fix_drift_and_texture(
-                                curr_chw, prev_chw, first_pass_face
+                                curr_chw, first_pass_face
                             )
                             temp_output = curr_chw.permute(1, 2, 0)
 
@@ -3574,9 +3648,8 @@ class FrameWorker(threading.Thread):
                     if k == 0:
                         first_pass_face = curr_chw.clone()
                     else:
-                        prev_chw = prev_face.permute(2, 0, 1)
                         curr_chw = self._fix_drift_and_texture(
-                            curr_chw, prev_chw, first_pass_face
+                            curr_chw, first_pass_face
                         )
                         temp_output = curr_chw.permute(1, 2, 0)
 
@@ -3616,9 +3689,8 @@ class FrameWorker(threading.Thread):
                     if k == 0:
                         first_pass_face = swapper_output.clone()
                     else:
-                        prev_chw = prev_face.permute(2, 0, 1)
                         swapper_output = self._fix_drift_and_texture(
-                            swapper_output, prev_chw, first_pass_face
+                            swapper_output, first_pass_face
                         )
 
                 swapper_output_hwc = swapper_output.permute(1, 2, 0)
@@ -3667,9 +3739,8 @@ class FrameWorker(threading.Thread):
                     if k == 0:
                         first_pass_face = curr_chw.clone()
                     else:
-                        prev_chw = prev_face.permute(2, 0, 1)
                         curr_chw = self._fix_drift_and_texture(
-                            curr_chw, prev_chw, first_pass_face
+                            curr_chw, first_pass_face
                         )
 
                     input_face_affined = curr_chw.permute(1, 2, 0)
@@ -3713,9 +3784,8 @@ class FrameWorker(threading.Thread):
                     if k == 0:
                         first_pass_face = swapper_output.clone()
                     else:
-                        prev_chw = prev_face.permute(2, 0, 1)
                         swapper_output = self._fix_drift_and_texture(
-                            swapper_output, prev_chw, first_pass_face
+                            swapper_output, first_pass_face
                         )
 
                     input_face_affined = swapper_output.permute(1, 2, 0)
@@ -4301,9 +4371,6 @@ class FrameWorker(threading.Thread):
             raw_kps_crop = tform(kps_203)
             kps_all_crop = np.array(raw_kps_crop, dtype=np.float32)
 
-        # STATE TRACKER: Suit si le tenseur 'swap' a subi une modification géométrique
-        is_geometry_altered = False
-
         # FW-PERF-5: use promoted instance-attribute transforms (initialized in
         # set_scaling_transforms) instead of constructing new objects each call
         t512_mask = self.t512_mask
@@ -4505,18 +4572,26 @@ class FrameWorker(threading.Thread):
                 or parameters["FaceExpressionBrowsToggle"]
                 or parameters["FaceExpressionGeneralToggle"]
                 or parameters.get("FaceExpressionModeSelection", "Advanced") == "Simple"
+                or parameters.get("FaceExpressionModeSelection", "Advanced") == "Recast"
             )
             and parameters["FaceExpressionBeforeTypeSelection"] == "Beginning"
         ):
-            swap = self.frame_edits.apply_face_expression_restorer(
-                original_face_512,
-                swap,
-                cast(dict, parameters),
-                cast(dict, control),
-                driving_kps=kps_all_crop,
-                target_kps=None if is_geometry_altered else kps_all_crop,
-            )
-            is_geometry_altered = True
+            if parameters.get("FaceExpressionModeSelection", "Advanced") == "Recast":
+                swap = self.frame_edits.apply_perform_recast(
+                    original_face_512,
+                    swap,
+                    cast(dict, parameters),
+                    cast(dict, control),
+                    driving_kps=kps_all_crop,
+                )
+            else:
+                swap = self.frame_edits.apply_face_expression_restorer(
+                    original_face_512,
+                    swap,
+                    cast(dict, parameters),
+                    cast(dict, control),
+                    driving_kps=kps_all_crop,
+                )
 
         # Face editor beginning
         if (
@@ -4537,9 +4612,7 @@ class FrameWorker(threading.Thread):
                 swap,
                 parameters,
                 control,
-                kps_all=None if is_geometry_altered else kps_all_crop,
             )
-            is_geometry_altered = True
 
         # First Denoiser pass - Before Restorers
         if control.get("DenoiserUNetEnableBeforeRestorersToggle", False):
@@ -4796,6 +4869,20 @@ class FrameWorker(threading.Thread):
                     antialias=True,
                 )(swap_mask_noFP)
 
+            # --- START FIX: BORDER BLUR ALIGNMENT ---
+            # The standard Occluder blurs the global swap_mask, softening the harsh
+            # border_mask edges. DFLXSeg blurs its mask internally, leaving the base
+            # swap_mask edges razor-sharp. We apply the blur here to soften the boundaries
+            # BEFORE multiplying XSeg, avoiding double-blurring the XSeg internal edges.
+            if not parameters.get("OccluderEnableToggle", False):
+                blur_amount = parameters.get("OccluderXSegBlurSlider", 0)
+                if blur_amount > 0:
+                    kernel_size = blur_amount * 2 + 1
+                    sigma = (blur_amount + 1) * 0.2
+                    gauss_op = v2.GaussianBlur(kernel_size, sigma)
+                    swap_mask = gauss_op(swap_mask)
+                    swap_mask_noFP = gauss_op(swap_mask_noFP)
+            # --- END FIX ---
             # apply_dfl_xseg returns inverted masks (0=Face, 1=BG).
             # We multiply by (1 - mask) to carve out the background.
             swap_mask_noFP.mul_(1.0 - outpred_noFP_res)
@@ -4895,19 +4982,27 @@ class FrameWorker(threading.Thread):
                 or parameters["FaceExpressionBrowsToggle"]
                 or parameters["FaceExpressionGeneralToggle"]
                 or parameters.get("FaceExpressionModeSelection", "Advanced") == "Simple"
+                or parameters.get("FaceExpressionModeSelection", "Advanced") == "Recast"
             )
             and parameters["FaceExpressionBeforeTypeSelection"]
             == "After First Restorer"
         ):
-            swap = self.frame_edits.apply_face_expression_restorer(
-                original_face_512,
-                swap,
-                cast(dict, parameters),
-                cast(dict, control),
-                driving_kps=kps_all_crop,
-                target_kps=None if is_geometry_altered else kps_all_crop,
-            )
-            is_geometry_altered = True
+            if parameters.get("FaceExpressionModeSelection", "Advanced") == "Recast":
+                swap = self.frame_edits.apply_perform_recast(
+                    original_face_512,
+                    swap,
+                    cast(dict, parameters),
+                    cast(dict, control),
+                    driving_kps=kps_all_crop,
+                )
+            else:
+                swap = self.frame_edits.apply_face_expression_restorer(
+                    original_face_512,
+                    swap,
+                    cast(dict, parameters),
+                    cast(dict, control),
+                    driving_kps=kps_all_crop,
+                )
 
         # Face Editor (After First)
         if (
@@ -4928,9 +5023,8 @@ class FrameWorker(threading.Thread):
                 swap_restorecalc,
                 parameters,
                 control,
-                kps_all=None if is_geometry_altered else kps_all_crop,
             )
-            is_geometry_altered = True
+
             if swap_mask_noFP.shape[-1] != swap.shape[-1]:
                 swap_mask = v2.Resize((swap.shape[-2], swap.shape[-1]), antialias=True)(
                     swap_mask_noFP
@@ -4983,19 +5077,27 @@ class FrameWorker(threading.Thread):
                 or parameters["FaceExpressionBrowsToggle"]
                 or parameters["FaceExpressionGeneralToggle"]
                 or parameters.get("FaceExpressionModeSelection", "Advanced") == "Simple"
+                or parameters.get("FaceExpressionModeSelection", "Advanced") == "Recast"
             )
             and parameters["FaceExpressionBeforeTypeSelection"]
             == "After Second Restorer"
         ):
-            swap = self.frame_edits.apply_face_expression_restorer(
-                original_face_512,
-                swap,
-                cast(dict, parameters),
-                cast(dict, control),
-                driving_kps=kps_all_crop,
-                target_kps=None if is_geometry_altered else kps_all_crop,
-            )
-            is_geometry_altered = True
+            if parameters.get("FaceExpressionModeSelection", "Advanced") == "Recast":
+                swap = self.frame_edits.apply_perform_recast(
+                    original_face_512,
+                    swap,
+                    cast(dict, parameters),
+                    cast(dict, control),
+                    driving_kps=kps_all_crop,
+                )
+            else:
+                swap = self.frame_edits.apply_face_expression_restorer(
+                    original_face_512,
+                    swap,
+                    cast(dict, parameters),
+                    cast(dict, control),
+                    driving_kps=kps_all_crop,
+                )
 
         # Editor (After Second)
         if (
@@ -5016,9 +5118,8 @@ class FrameWorker(threading.Thread):
                 swap,
                 parameters,
                 control,
-                kps_all=None if is_geometry_altered else kps_all_crop,
             )
-            is_geometry_altered = True
+
             if swap_mask_noFP.shape[-1] != swap.shape[-1]:
                 swap_mask = v2.Resize((swap.shape[-2], swap.shape[-1]), antialias=True)(
                     swap_mask_noFP
@@ -5098,8 +5199,9 @@ class FrameWorker(threading.Thread):
                 swap = faceutil.apply_adain_color_transfer(
                     swap,
                     original_face_for_color,
-                    mask_autocolor,
+                    swap_mask,
                     parameters["AutoColorBlendAmountSlider"],
+                    calc_mask=mask_autocolor,
                 )
 
         # --- TRANSFER TEXTURE ---
@@ -5367,9 +5469,7 @@ class FrameWorker(threading.Thread):
                 swap,
                 parameters,
                 control,
-                kps_all=None if is_geometry_altered else kps_all_crop,
             )
-            is_geometry_altered = True
 
             if swap_mask_noFP.shape[-1] != swap.shape[-1]:
                 swap_mask = v2.Resize((swap.shape[-2], swap.shape[-1]), antialias=True)(
@@ -5561,8 +5661,9 @@ class FrameWorker(threading.Thread):
                 swap = faceutil.apply_adain_color_transfer(
                     swap,
                     original_face_512,
-                    mask_autocolor_end,
+                    swap_mask,
                     parameters["EndingColorBlendAmountSlider"],
+                    calc_mask=mask_autocolor_end,
                 )
 
         # Third denoiser pass - After all restorations, colour corrections and ending colour transfer.

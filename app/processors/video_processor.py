@@ -218,6 +218,7 @@ class VideoProcessor(QObject):
 
         # --- Subprocesses ---
         self.virtcam: pyvirtualcam.Camera | None = None
+        self._virtcam_error_latch: bool = False
         self.encoder = FFmpegEncoder()
         self.ffplay_sound_sp: subprocess.Popen | None = (
             None  # ffplay process for live audio
@@ -818,9 +819,12 @@ class VideoProcessor(QObject):
                 if not ret:
                     if self.ffmpeg_input_sp:
                         # All frame numbers are in output frame space.
-                        remaining_frames = self.max_frame_number - self.current_frame_number
+                        remaining_frames = (
+                            self.max_frame_number - self.current_frame_number
+                        )
                         eof_like = (
-                            self.current_frame_number >= self.max_frame_number - TAIL_TOLERANCE
+                            self.current_frame_number
+                            >= self.max_frame_number - TAIL_TOLERANCE
                             or remaining_frames <= self.max_consecutive_errors
                         )
                         if eof_like:
@@ -890,14 +894,14 @@ class VideoProcessor(QObject):
                         # instead of an error stop to avoid marking outputs as incomplete when
                         # the read failures are simply due to end-of-file conditions.
                         try:
-                            near_eof = (
-                                fn >= self.max_frame_number - TAIL_TOLERANCE
-                            )
+                            near_eof = fn >= self.max_frame_number - TAIL_TOLERANCE
                         except Exception:
                             near_eof = False
 
                         if near_eof:
-                            print("[INFO] Feeder: Consecutive read errors occurred near EOF; treating as EOF.")
+                            print(
+                                "[INFO] Feeder: Consecutive read errors occurred near EOF; treating as EOF."
+                            )
                         else:
                             self.stopped_by_error_limit = True
 
@@ -1384,27 +1388,34 @@ class VideoProcessor(QObject):
         Removed sleep_until_next_frame() to prevent blocking the Main GUI Thread.
         The UI metronome (QTimer) already handles perfect timing and synchronization.
         """
-        if self.main_window.control["SendVirtCamFramesEnableToggle"] and self.virtcam:
-            height, width, _ = frame.shape
-            if self.virtcam.height != height or self.virtcam.width != width:
-                # Resolution changed (e.g. source swap / restorer output differs).
-                # Avoid hammering OBS with rapid close/reopen cycles — schedule a
-                # single deferred restart so the driver gets adequate settling time.
-                # We skip this frame rather than sending one with the wrong size.
-                print(
-                    f"[INFO] VirtCam resolution changed ({self.virtcam.width}x{self.virtcam.height} -> {width}x{height}). Restarting virtual camera."
-                )
+        if self.main_window.control.get("SendVirtCamFramesEnableToggle", False):
+            # JIT Initialization: Ensure VirtCam is spun up if toggle is active but uninitialized.
+            # We use a Circuit Breaker (_virtcam_error_latch) to prevent infinite loops if initialization completely fails.
+            if not self.virtcam and not getattr(self, "_virtcam_error_latch", False):
                 self.enable_virtualcam()
-                return  # Frame already consumed; next tick will send at the new size.
 
-            # Need to check again if virtcam was successfully re-enabled
+            # Need to check again if virtcam was successfully enabled
             if self.virtcam:
-                try:
-                    self.virtcam.send(frame)
-                    # REMOVED: self.virtcam.sleep_until_next_frame()
-                    # It forces the UI thread to freeze and fights the metronome.
-                except Exception as e:
-                    print(f"[WARN] Failed sending frame to virtualcam: {e}")
+                height, width, _ = frame.shape
+                if self.virtcam.height != height or self.virtcam.width != width:
+                    # Resolution changed (e.g. source swap / restorer output differs).
+                    # Avoid hammering OBS with rapid close/reopen cycles
+                    print(
+                        f"[INFO] VirtCam resolution changed ({self.virtcam.width}x{self.virtcam.height} -> {width}x{height}). Restarting virtual camera."
+                    )
+                    self.enable_virtualcam()
+                    return  # Frame already consumed; next tick will send at the new size.
+
+                if self.virtcam:
+                    try:
+                        self.virtcam.send(frame)
+                    except Exception as e:
+                        print(
+                            f"[WARN] Catastrophic failure sending frame to virtualcam: {e}"
+                        )
+                        # If the driver crashes midway, trip the circuit breaker and disable to prevent spam.
+                        self._virtcam_error_latch = True
+                        self.disable_virtualcam()
 
     def set_number_of_threads(self, value):
         """Updates the thread count for the *next* worker pool."""
@@ -1627,7 +1638,9 @@ class VideoProcessor(QObject):
                 self.stop_processing()
                 return
 
-            print("[INFO] Sync: Reading first frame from FFmpeg recording input stream...")
+            print(
+                "[INFO] Sync: Reading first frame from FFmpeg recording input stream..."
+            )
             ret, frame_bgr = self._read_frame_from_ffmpeg_input_stream()
             print(f"[INFO] Sync: Initial FFmpeg stream read complete (Result: {ret}).")
 
@@ -2660,7 +2673,9 @@ class VideoProcessor(QObject):
             self._used_ffmpeg_cap = False
             return False
 
-    def _read_frame_from_ffmpeg_input_stream(self) -> tuple[bool, Optional[numpy.ndarray]]:
+    def _read_frame_from_ffmpeg_input_stream(
+        self,
+    ) -> tuple[bool, Optional[numpy.ndarray]]:
         """Read one BGR frame from FFmpeg rawvideo stdout."""
         if self.ffmpeg_input_prefetched_frame is not None:
             frame = self.ffmpeg_input_prefetched_frame
@@ -2738,7 +2753,12 @@ class VideoProcessor(QObject):
         except Exception:
             pass
 
-    def source_to_output_frame(self, source_frame: int, src_fps: float | None = None, out_fps: float | None = None) -> int:
+    def source_to_output_frame(
+        self,
+        source_frame: int,
+        src_fps: float | None = None,
+        out_fps: float | None = None,
+    ) -> int:
         """Map a source-frame index to output-frame index using fps values.
 
         Falls back to `self.recording_source_fps` and `self.fps` when fps args
@@ -2748,13 +2768,22 @@ class VideoProcessor(QObject):
             sf = int(source_frame)
         except Exception:
             return 0
-        src = float(src_fps) if src_fps is not None else float(self.recording_source_fps or 0)
+        src = (
+            float(src_fps)
+            if src_fps is not None
+            else float(self.recording_source_fps or 0)
+        )
         out = float(out_fps) if out_fps is not None else float(self.fps or 0)
         if src <= 0 or out <= 0:
             return sf
         return max(0, round(float(sf) * out / src))
 
-    def output_to_source_frame(self, output_frame: int, src_fps: float | None = None, out_fps: float | None = None) -> int:
+    def output_to_source_frame(
+        self,
+        output_frame: int,
+        src_fps: float | None = None,
+        out_fps: float | None = None,
+    ) -> int:
         """Map an output-frame index back to source-frame index using fps values.
 
         Falls back to `self.recording_source_fps` and `self.fps` when fps args
@@ -2764,7 +2793,11 @@ class VideoProcessor(QObject):
             of = int(output_frame)
         except Exception:
             return 0
-        src = float(src_fps) if src_fps is not None else float(self.recording_source_fps or 0)
+        src = (
+            float(src_fps)
+            if src_fps is not None
+            else float(self.recording_source_fps or 0)
+        )
         out = float(out_fps) if out_fps is not None else float(self.fps or 0)
         if src <= 0 or out <= 0:
             return of
@@ -2817,7 +2850,10 @@ class VideoProcessor(QObject):
             self.tail_pending_stall_start_sec = now_sec
             return True
 
-        if now_sec - self.tail_pending_stall_start_sec >= TAIL_PENDING_STALL_TIMEOUT_SEC:
+        if (
+            now_sec - self.tail_pending_stall_start_sec
+            >= TAIL_PENDING_STALL_TIMEOUT_SEC
+        ):
             # Stall exceeded timeout: force finalize to avoid hang.
             # Do not mark read-error/incomplete here; this path is a queue-drain
             # safeguard and can happen even when encoded output is otherwise valid.
@@ -3979,7 +4015,10 @@ class VideoProcessor(QObject):
                 source_end_frame = self.output_to_source_frame(end_frame_for_calc)
                 source_span_duration = max(
                     0.0,
-                    float((source_end_frame - processing_start_src) / float(self.recording_source_fps)),
+                    float(
+                        (source_end_frame - processing_start_src)
+                        / float(self.recording_source_fps)
+                    ),
                 )
             else:
                 source_span_duration = (
@@ -3996,7 +4035,9 @@ class VideoProcessor(QObject):
                     else 0.0
                 )
             encoded_duration = (
-                float(actual_frames_processed / float(self.fps)) if self.fps > 0 else 0.0
+                float(actual_frames_processed / float(self.fps))
+                if self.fps > 0
+                else 0.0
             )
             print(
                 f"[INFO] Calculated recording end time: {self.play_end_time:.3f}s "
@@ -4252,7 +4293,11 @@ class VideoProcessor(QObject):
             if self.file_type == "video" and self.media_path:
                 last_processed = self.next_frame_to_display - 1
                 start_frame = getattr(self, "processing_start_frame", 0)
-                if self._used_ffmpeg_cap and self.fps > 0 and self.recording_source_fps > 0:
+                if (
+                    self._used_ffmpeg_cap
+                    and self.fps > 0
+                    and self.recording_source_fps > 0
+                ):
                     last_processed = self.output_to_source_frame(last_processed)
                 reset_frame = max(start_frame, last_processed)
                 # Slider stays in source frame space (approach 2).
@@ -4313,6 +4358,9 @@ class VideoProcessor(QObject):
 
     def enable_virtualcam(self, backend=False):
         """Starts the pyvirtualcam device."""
+
+        # Reset the circuit breaker latch when an explicit start is requested
+        self._virtcam_error_latch = False
 
         # Guard: Only run if the user has actually enabled the virtual cam
         if not self.main_window.control.get("SendVirtCamFramesEnableToggle", False):
@@ -4378,15 +4426,22 @@ class VideoProcessor(QObject):
             except Exception as e:
                 if attempt == 0:
                     # First attempt failed (driver may still be releasing the handle).
-                    # Wait longer and try once more before giving up.
-                    print(f"[WARN] Virtual camera open failed (attempt 1): {e}. Retrying in 500 ms")
+                    print(
+                        f"[WARN] Virtual camera open failed (attempt 1): {e}. Retrying in 500 ms"
+                    )
                     time.sleep(0.5)
                 else:
+                    # Second attempt failed. Trip the circuit breaker to prevent infinite loop.
                     print(f"[ERROR] Failed to enable virtual camera: {e}")
                     self.virtcam = None
+                    self._virtcam_error_latch = True
 
     def disable_virtualcam(self):
         """Stops the pyvirtualcam device."""
+        # Also reset the error latch when explicitly turning it off,
+        # allowing a fresh try next time the user turns it on.
+        self._virtcam_error_latch = False
+
         if self.virtcam:
             print(f"[INFO] Disabling virtual camera '{self.virtcam.device}'.")
             try:
@@ -4779,8 +4834,7 @@ class VideoProcessor(QObject):
 
         # Add suffix only for real read-error stops.
         has_real_read_errors = (
-            int(self.read_error_skip_count) > 0
-            or int(self.consecutive_read_errors) > 0
+            int(self.read_error_skip_count) > 0 or int(self.consecutive_read_errors) > 0
         )
         if self.stopped_by_error_limit and has_real_read_errors:
             path_obj = Path(final_file_path)
@@ -5144,16 +5198,38 @@ class VideoProcessor(QObject):
             f"[INFO] Init Webcam: Device={webcam_index}, Backend={backend_name}, Target={target_width}x{target_height} @ {target_fps}fps"
         )
 
-        # 2. Initialize VideoCapture with the selected Backend
-        if self.media_capture:
-            misc_helpers.release_capture(self.media_capture)
-            self.media_capture = None
+        # 2. Initialize VideoCapture with the selected Backend (Prevent Race Condition)
+        reinitialize_needed = True
 
-        try:
-            self.media_capture = cv2.VideoCapture(webcam_index, backend_id)
-        except Exception as e:
-            print(f"[ERROR] Failed to init webcam with backend {backend_name}: {e}")
-            self.media_capture = cv2.VideoCapture(webcam_index)
+        # Determine if we can safely reuse the existing capture
+        if self.media_capture and self.media_capture.isOpened():
+            selected_btn = getattr(self.main_window, "selected_video_button", None)
+            from app.ui.widgets import widget_components
+
+            if isinstance(
+                selected_btn, widget_components.TargetMediaCardButton
+            ) and getattr(selected_btn, "is_webcam", False):
+                if (
+                    selected_btn.webcam_index == webcam_index
+                    and selected_btn.webcam_backend == backend_id
+                ):
+                    reinitialize_needed = False
+                    print(
+                        "[INFO] Reusing existing webcam capture to prevent hardware lock issues."
+                    )
+
+        if reinitialize_needed:
+            if self.media_capture:
+                misc_helpers.release_capture(self.media_capture)
+                self.media_capture = None
+                # CRITICAL: Wait for OS driver hardware lock to fully release
+                time.sleep(0.5)
+
+            try:
+                self.media_capture = cv2.VideoCapture(webcam_index, backend_id)
+            except Exception as e:
+                print(f"[ERROR] Failed to init webcam with backend {backend_name}: {e}")
+                self.media_capture = cv2.VideoCapture(webcam_index)
 
         if not (self.media_capture and self.media_capture.isOpened()):
             print("[ERROR] Unable to open webcam source.")

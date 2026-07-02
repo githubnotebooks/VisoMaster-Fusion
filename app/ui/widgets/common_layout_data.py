@@ -233,11 +233,12 @@ COMMON_LAYOUT_DATA: Any = {
         "FaceExpressionModeSelection": {
             "level": 2,
             "label": "Mode",
-            "options": ["Simple", "Advanced"],
+            "options": ["Simple", "Advanced", "Recast"],
             "default": "Simple",
             "parentToggle": "FaceExpressionEnableBothToggle",
             "requiredToggleValue": True,
-            "help": "Choose 'Advanced' for fine-tuning and retargeting options.",
+            "help": "Choose 'Advanced' for fine-tuning and retargeting options. "
+            "'Recast' uses the PerformRecast model for expression-only transfer.",
         },
         "FaceExpressionCropScaleBothDecimalSlider": {
             "level": 2,
@@ -263,6 +264,144 @@ COMMON_LAYOUT_DATA: Any = {
             "requiredToggleValue": True,
             "help": "Changes the vy ratio for crop scale. Increase the value to capture the face more distantly.",
         },
+        # --- RECAST MODE WIDGETS (PerformRecast model) ---
+        "RecastModeSelection": {
+            "level": 3,
+            "label": "Recast Mode",
+            "options": ["Enhancement", "Replacement"],
+            "default": "Enhancement",
+            "parentToggle": "FaceExpressionEnableBothToggle",
+            "requiredToggleValue": True,
+            "parentSelection": "FaceExpressionModeSelection",
+            "requiredSelectionValue": "Recast",
+            "help": "Enhancement adds the driving expression on top of the swapped face's "
+            "expression. Replacement starts from the driving expression and blends back "
+            "the swapped face's eye/lip/jaw identity cues.",
+        },
+        "RecastExpressionFactorDecimalSlider": {
+            "level": 3,
+            "label": "Expression Strength",
+            "min_value": "0.0",
+            "max_value": "3.0",
+            "default": "1.0",
+            "step": 0.1,
+            "decimals": 1,
+            "parentToggle": "FaceExpressionEnableBothToggle",
+            "requiredToggleValue": True,
+            "parentSelection": "FaceExpressionModeSelection",
+            "requiredSelectionValue": "Recast",
+            "help": "Strength / exaggeration of the transferred expression. 0.0 keeps "
+            "the swapped face's expression, 1.0 applies the full driving expression, "
+            ">1.0 exaggerates it (up to 3.0 for stylization).",
+        },
+        "RecastCropScaleDecimalSlider": {
+            "level": 3,
+            "label": "Recast Crop Scale",
+            "min_value": "1.5",
+            "max_value": "3.0",
+            "default": "2.3",
+            "step": 0.1,
+            "decimals": 1,
+            "parentToggle": "FaceExpressionEnableBothToggle",
+            "requiredToggleValue": True,
+            "parentSelection": "FaceExpressionModeSelection",
+            "requiredSelectionValue": "Recast",
+            "help": "Face crop framing fed to the PerformRecast models, independent of "
+            "the shared 'Crop Scale' used by the Simple/Advanced (LivePortrait) modes. "
+            "LOWER = tighter face = more identity detail / better similarity, but too "
+            "tight for a given pose makes the generator emit a black frame (which is "
+            "skipped, keeping the plain swap). RAISE it if you see black/missing faces — "
+            "VR180 framing usually needs ~2.8-3.0. fp16 widens the black-prone range, so "
+            "if you want to go tighter for similarity and see flicker, either raise this "
+            "slightly or tune similarity via Mode / Expression Strength / Eye-Lip weights.",
+        },
+        "RecastAnimationRegionSelection": {
+            "level": 3,
+            "label": "Animation Region",
+            "options": ["all", "eyes", "lips"],
+            "default": "all",
+            "parentToggle": "FaceExpressionEnableBothToggle",
+            "requiredToggleValue": True,
+            "parentSelection": "FaceExpressionModeSelection",
+            "requiredSelectionValue": "Recast",
+            "help": "Restrict the transferred expression to a facial region. The swapped "
+            "face's own expression is kept outside the selected region. Index groups: "
+            "eyes = keypoints 31-38, lips/jaw = keypoints 44-46.",
+        },
+        "RecastEyeDrivingWeightDecimalSlider": {
+            "level": 4,
+            "label": "Eye Driving Weight",
+            "min_value": "0.0",
+            "max_value": "1.0",
+            "default": "0.7",
+            "step": 0.05,
+            "decimals": 2,
+            "parentToggle": "FaceExpressionEnableBothToggle",
+            "requiredToggleValue": True,
+            "parentSelection": "FaceExpressionModeSelection",
+            "requiredSelectionValue": "Recast",
+            "help": "Replacement mode only: how strongly the driver overrides the swapped "
+            "face's eye-channel identity. 0.0 keeps the swapped face's eyes, 1.0 fully "
+            "follows the driver. Default 0.7 matches the upstream PerformRecast blend.",
+        },
+        "RecastLipDrivingWeightDecimalSlider": {
+            "level": 4,
+            "label": "Lip Driving Weight",
+            "min_value": "0.0",
+            "max_value": "1.0",
+            "default": "0.8",
+            "step": 0.05,
+            "decimals": 2,
+            "parentToggle": "FaceExpressionEnableBothToggle",
+            "requiredToggleValue": True,
+            "parentSelection": "FaceExpressionModeSelection",
+            "requiredSelectionValue": "Recast",
+            "help": "Replacement mode only: how strongly the driver overrides the swapped "
+            "face's lip/jaw identity. 0.0 keeps the swapped face's lips, 1.0 fully follows "
+            "the driver. Default 0.8 matches the upstream PerformRecast blend.",
+        },
+        "RecastExpressionSmoothToggle": {
+            "level": 3,
+            "label": "Smooth Expression",
+            "default": False,
+            "parentToggle": "FaceExpressionEnableBothToggle",
+            "requiredToggleValue": True,
+            "parentSelection": "FaceExpressionModeSelection",
+            "requiredSelectionValue": "Recast",
+            "help": "Temporally smooth the driving expression with a per-face exponential "
+            "moving average to reduce micro-jitter / flicker between frames.",
+        },
+        "RecastSmoothStrengthDecimalSlider": {
+            "level": 4,
+            "label": "Smooth Strength",
+            "min_value": "0.0",
+            "max_value": "0.95",
+            "default": "0.5",
+            "step": 0.05,
+            "decimals": 2,
+            "parentToggle": "FaceExpressionEnableBothToggle & RecastExpressionSmoothToggle",
+            "requiredToggleValue": True,
+            "parentSelection": "FaceExpressionModeSelection",
+            "requiredSelectionValue": "Recast",
+            "help": "Weight given to the previous frame's expression. 0.0 = no smoothing, "
+            "higher = smoother but more lag.",
+        },
+        "RecastPasteBackFeatherDecimalSlider": {
+            "level": 3,
+            "label": "Paste-back Feather",
+            "min_value": "0.0",
+            "max_value": "0.3",
+            "default": "0.0",
+            "step": 0.02,
+            "decimals": 2,
+            "parentToggle": "FaceExpressionEnableBothToggle",
+            "requiredToggleValue": True,
+            "parentSelection": "FaceExpressionModeSelection",
+            "requiredSelectionValue": "Recast",
+            "help": "Feather the recast crop border so it blends into the surrounding "
+            "swapped face instead of showing a hard crop seam. 0.0 disables it.",
+        },
+        # --- SIMPLE MODE WIDGETS (RESTORING OLD FUNCTIONALITY) ---
         "FaceExpressionNeutralDecimalSlider": {
             "level": 2,
             "label": "Neutral Factor",
@@ -273,9 +412,10 @@ COMMON_LAYOUT_DATA: Any = {
             "decimals": 2,
             "parentToggle": "FaceExpressionEnableBothToggle",
             "requiredToggleValue": True,
+            "parentSelection": "FaceExpressionModeSelection",
+            "requiredSelectionValue": "Simple",
             "help": "Percentage of expression to add. Swapped Face already has some expression due to swap, adding complet expression is not recommended and slider should be lower than 1.0",
         },
-        # --- SIMPLE MODE WIDGETS (RESTORING OLD FUNCTIONALITY) ---
         "FaceExpressionFriendlyFactorDecimalSlider": {
             "level": 3,
             "label": "Expression Factor",
@@ -349,6 +489,20 @@ COMMON_LAYOUT_DATA: Any = {
             "parentSelection": "FaceExpressionModeSelection",
             "requiredSelectionValue": "Advanced",
             "help": "Activate the eyes face expression restorer",
+        },
+        "FaceExpressionNeutral_EyesDecimalSlider": {
+            "level": 4,
+            "label": "Neutral Eyes Factor",
+            "min_value": "0.00",
+            "max_value": "1.00",
+            "default": "0.30",
+            "step": 0.05,
+            "decimals": 2,
+            "parentToggle": "FaceExpressionEnableBothToggle & FaceExpressionEyesToggle",
+            "requiredToggleValue": True,
+            "parentSelection": "FaceExpressionModeSelection",
+            "requiredSelectionValue": "Advanced",
+            "help": "Percentage of expression to add. Swapped Face already has some expression due to swap, adding complet expression is not recommended and slider should be lower than 1.0",
         },
         "FaceExpressionCameraGazeToggle": {
             "level": 4,
@@ -500,6 +654,20 @@ COMMON_LAYOUT_DATA: Any = {
             "requiredSelectionValue": "Advanced",
             "help": "Activate the restoration of eyebrows.",
         },
+        "FaceExpressionNeutral_BrowsDecimalSlider": {
+            "level": 4,
+            "label": "Neutral Brows Factor",
+            "min_value": "0.00",
+            "max_value": "1.00",
+            "default": "0.30",
+            "step": 0.05,
+            "decimals": 2,
+            "parentToggle": "FaceExpressionEnableBothToggle & FaceExpressionBrowsToggle",
+            "requiredToggleValue": True,
+            "parentSelection": "FaceExpressionModeSelection",
+            "requiredSelectionValue": "Advanced",
+            "help": "Percentage of expression to add. Swapped Face already has some expression due to swap, adding complet expression is not recommended and slider should be lower than 1.0",
+        },
         "FaceExpressionRelativeBrowsToggle": {
             "level": 4,
             "label": "Relative Position",
@@ -533,6 +701,20 @@ COMMON_LAYOUT_DATA: Any = {
             "parentSelection": "FaceExpressionModeSelection",
             "requiredSelectionValue": "Advanced",
             "help": "Activate the lips face expression restorer",
+        },
+        "FaceExpressionNeutral_LipsDecimalSlider": {
+            "level": 4,
+            "label": "Neutral Lips Factor",
+            "min_value": "0.00",
+            "max_value": "1.00",
+            "default": "0.30",
+            "step": 0.05,
+            "decimals": 2,
+            "parentToggle": "FaceExpressionEnableBothToggle & FaceExpressionLipsToggle",
+            "requiredToggleValue": True,
+            "parentSelection": "FaceExpressionModeSelection",
+            "requiredSelectionValue": "Advanced",
+            "help": "Percentage of expression to add. Swapped Face already has some expression due to swap, adding complet expression is not recommended and slider should be lower than 1.0",
         },
         "FaceExpressionRelativeLipsToggle": {
             "level": 4,
@@ -615,6 +797,20 @@ COMMON_LAYOUT_DATA: Any = {
             "parentSelection": "FaceExpressionModeSelection",
             "requiredSelectionValue": "Advanced",
             "help": "Activate the restoration of general expressions. (Comment or Uncomment face parts in frame_edits.py for more control)",
+        },
+        "FaceExpressionNeutral_GeneralDecimalSlider": {
+            "level": 4,
+            "label": "Neutral General Factor",
+            "min_value": "0.00",
+            "max_value": "1.00",
+            "default": "0.30",
+            "step": 0.05,
+            "decimals": 2,
+            "parentToggle": "FaceExpressionEnableBothToggle & FaceExpressionGeneralToggle",
+            "requiredToggleValue": True,
+            "parentSelection": "FaceExpressionModeSelection",
+            "requiredSelectionValue": "Advanced",
+            "help": "Percentage of expression to add. Swapped Face already has some expression due to swap, adding complet expression is not recommended and slider should be lower than 1.0",
         },
         "FaceExpressionRelativeGeneralToggle": {
             "level": 4,

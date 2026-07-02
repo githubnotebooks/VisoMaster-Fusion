@@ -68,11 +68,13 @@ from app.processors.face_swappers import FaceSwappers
 from app.processors.frame_enhancers import FrameEnhancers
 from app.processors.face_editors import FaceEditors
 from app.processors.face_reaging import FaceReaging
+from app.processors.perform_recast import PerformRecast
 from app.processors.utils.dfm_model import DFMModel
 from app.processors.models_data import (
     models_list,
     arcface_mapping_model_dict,
     fp16_safe_models_list,
+    tensorrt_shape_infer_models,
 )
 from app.helpers.miscellaneous import is_file_exists
 from app.helpers.downloader import download_file
@@ -301,6 +303,7 @@ class ModelsProcessor(QtCore.QObject):
         self.frame_enhancers = FrameEnhancers(self)
         self.face_editors = FaceEditors(self)
         self.face_reaging = FaceReaging(self)
+        self.perform_recast = PerformRecast(self)
 
         # Initialize Mask Latent
         self.lp_mask_crop_latent = faceutil.create_faded_inner_mask(
@@ -527,6 +530,78 @@ class ModelsProcessor(QtCore.QObject):
     def binding_device_id(self) -> int:
         return self.gpu_id if self.device_type != "cpu" else 0
 
+    def _ensure_trt_ready_onnx(self, model_name: str, onnx_path: str) -> str:
+        """Return an ONNX path that the TensorRT EP can build an engine from.
+
+        Some models (see ``tensorrt_shape_infer_models``) contain ops — notably
+        5-D ``GridSample`` in the PerformRecast warping module — whose output
+        tensors carry no static shape. The TensorRT EP refuses such graphs with
+        "has no shape specified. Please run shape inference on the onnx model
+        first." We fix this once by pinning the batch dimension to 1 (the app
+        always feeds a single face) and running ONNX Runtime's symbolic shape
+        inference, then caching the result next to the original as
+        ``*.trtshape.onnx``. The cached file is reused unless the source ONNX is
+        newer. For models not in the list, the original path is returned as-is.
+        """
+        if model_name not in tensorrt_shape_infer_models:
+            return onnx_path
+        if not onnx_path.lower().endswith(".onnx"):
+            return onnx_path
+
+        sidecar_path = onnx_path[: -len(".onnx")] + ".trtshape.onnx"
+        try:
+            if os.path.exists(sidecar_path) and (
+                os.path.getmtime(sidecar_path) >= os.path.getmtime(onnx_path)
+            ):
+                return sidecar_path
+
+            print(
+                f"[INFO] Preparing TensorRT-ready (shape-inferred) ONNX for {model_name}..."
+            )
+            # This shape-inference pass can take a noticeable amount of time for
+            # large graphs (the PerformRecast warping module is ~200 MB) and runs
+            # *before* the engine-build probe, so without a dialog the UI looks
+            # frozen with no indication of what is happening. Surface a dialog for
+            # this preprocessing step too. It is only paid once (result cached).
+            self.show_build_dialog.emit(
+                "Preparing TensorRT Model",
+                f"Running shape inference for:\n{model_name}\n\n"
+                f"This one-time step prepares the model for the TensorRT engine "
+                f"build and may take a moment.",
+            )
+            try:
+                from onnxruntime.tools.onnx_model_utils import make_dim_param_fixed
+                from onnxruntime.tools.symbolic_shape_infer import (
+                    SymbolicShapeInference,
+                )
+
+                model = onnx.load(onnx_path)
+                # Pin the dynamic 'batch' axis to 1 so symbolic dims (e.g.
+                # "50*batch") resolve to concrete values the TensorRT builder
+                # accepts.
+                try:
+                    make_dim_param_fixed(model.graph, "batch", 1)
+                except Exception as dim_err:
+                    # Not fatal — symbolic shape inference may still add shapes.
+                    print(f"[WARN] Could not pin batch dim for {model_name}: {dim_err}")
+                model = SymbolicShapeInference.infer_shapes(
+                    model, auto_merge=True, guess_output_rank=True
+                )
+                onnx.save(model, sidecar_path)
+                del model
+                gc.collect()
+            finally:
+                self.hide_build_dialog.emit()
+            print(f"[INFO] Wrote shape-inferred ONNX: {os.path.basename(sidecar_path)}")
+            return sidecar_path
+        except Exception as e:
+            print(
+                f"[WARN] Shape-inference preprocessing failed for {model_name} ({e}). "
+                f"Falling back to the original ONNX."
+            )
+            traceback.print_exc()
+            return onnx_path
+
     def _check_tensorrt_cache(self, model_name: str, onnx_path: str) -> bool:
         """
         Checks if a valid TensorRT cache (ctx and engine file) exists for the given model.
@@ -692,6 +767,11 @@ class ModelsProcessor(QtCore.QObject):
                 )
                 return None
 
+            # Some models need a shape-inferred graph before the TensorRT EP can
+            # build an engine. This transparently swaps in a cached sidecar; the
+            # original path stays untouched for download/integrity checks.
+            onnx_path = self._ensure_trt_ready_onnx(model_name, onnx_path)
+
             build_was_triggered = (
                 False  # MP-05: flag to track if build dialog was shown
             )
@@ -771,7 +851,7 @@ class ModelsProcessor(QtCore.QObject):
                                 probe_process = ctx.Process(
                                     target=_probe_onnx_model_worker,
                                     args=(
-                                        self.models_path[model_name],
+                                        onnx_path,
                                         current_providers_list,
                                         model_trt_options,  # On passe les options dynamiques
                                         sess_options_dict,
@@ -870,7 +950,7 @@ class ModelsProcessor(QtCore.QObject):
                 session_options.log_severity_level = 3
 
                 model_instance = onnxruntime.InferenceSession(
-                    self.models_path[model_name],
+                    onnx_path,
                     sess_options=session_options,
                     providers=model_providers,
                 )
@@ -1601,6 +1681,11 @@ class ModelsProcessor(QtCore.QObject):
         """Unloads all loaded face editor models under the model lock."""
         with self.model_lock:
             self.face_editors.unload_models()
+
+    def unload_perform_recast_models(self):
+        """Unloads all loaded PerformRecast (Recast mode) models under the lock."""
+        with self.model_lock:
+            self.perform_recast.unload_models()
 
     def unload_face_mask_models(self):
         """Unloads all loaded face mask models under the model lock."""

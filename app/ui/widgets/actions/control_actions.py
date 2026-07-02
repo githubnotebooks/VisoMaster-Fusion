@@ -522,9 +522,16 @@ def _check_and_manage_face_editor_models(main_window: "MainWindow"):
     # Any LivePortrait feature is active if (Edit Face is fully on) OR (Expression Restore is on)
     any_editor_feature_active = true_edit_active or is_expr_restore_active
 
-    # Check the *actual* loaded state from the face_editors module
+    # Check the *actual* loaded state from the face_editors module. The
+    # PerformRecast ("Recast" mode) models are tracked separately because they
+    # are not part of the LivePortrait face-editor group.
+    recast_loaded = any(
+        models_processor.models.get(m) is not None
+        for m in models_processor.perform_recast.model_group
+    )
     models_are_currently_loaded = (
         models_processor.face_editors.current_face_editor_type is not None
+        or recast_loaded
     )
 
     if any_editor_feature_active and not models_are_currently_loaded:
@@ -541,6 +548,8 @@ def _check_and_manage_face_editor_models(main_window: "MainWindow"):
             "[INFO] Face Editor and Expression Restorer are inactive. Unloading LivePortrait models."
         )
         models_processor.unload_face_editor_models()
+        if recast_loaded:
+            models_processor.unload_perform_recast_models()
 
 
 def handle_face_editor_button_click(main_window: "MainWindow"):

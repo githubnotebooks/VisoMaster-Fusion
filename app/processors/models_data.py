@@ -6,6 +6,16 @@ models_dir = Path(__file__).resolve().parent.parent.parent / "model_assets"
 refldm_ckpts_path = models_dir / "ref-ldm_embedding/ckpts"
 os.makedirs(refldm_ckpts_path, exist_ok=True)
 
+# Ensure the grouped ONNX model subfolders exist up front. On a fresh/portable
+# install (and during portable app updates) these subfolders are otherwise only
+# created on first download — but the PerformRecast models were missing the
+# folder, so the portable updater had nowhere to place the freshly downloaded
+# ONNX files. Creating them here makes the destinations exist regardless of how
+# the models arrive (download vs. copy-in). The downloader also makes parent
+# dirs on demand, so this is belt-and-suspenders.
+for _subfolder in ("liveportrait_onnx", "performrecast_onnx"):
+    os.makedirs(models_dir / _subfolder, exist_ok=True)
+
 assets_repo = "https://github.com/visomaster/visomaster-assets/releases/download"
 
 arcface_mapping_model_dict = {
@@ -45,6 +55,16 @@ fp16_safe_models_list = [
     "LivePortraitStitchingLip",
     "LivePortraitStitching",
     "LivePortraitWarpingSpade",
+    # --- PerformRecast ---
+    # Only F/M are fp16-safe. We tried building W (warping_module) and G
+    # (spade_generator) as mixed-precision fp16 TensorRT engines from the fp32
+    # ONNX, but in practice fp16 makes the generator emit degenerate / black
+    # faces on many ordinary frames (the 5-D grid_sample / SPADE paths overflow
+    # in fp16) — so at the natural ~2.3 crop scale far too many frames had to be
+    # skipped. This is exactly the caveat documented upstream, so W/G are kept
+    # fp32 (intentionally absent from this list). Do NOT add them back.
+    "PerformRecastAppearanceFeatureExtractor",
+    "PerformRecastMotionExtractor",
     # --- Detectors ---
     "RetinaFace",
     "SCRFD2.5g",
@@ -100,6 +120,16 @@ fp16_safe_models_list = [
     "GhostFacev1",
     "GhostFacev2",
     "GhostFacev3",
+]
+
+# Models whose ONNX graph must be shape-inferred (with a static batch=1) before
+# the TensorRT EP can build an engine. The PerformRecast warping module contains
+# 5-D GridSample nodes whose outputs have no static shape, which makes the TRT EP
+# abort with "has no shape specified. Please run shape inference on the onnx
+# model first." The loader transparently builds a cached, shape-inferred sidecar
+# (``*.trtshape.onnx``) for these models. See ModelsProcessor._ensure_trt_ready_onnx.
+tensorrt_shape_infer_models = [
+    "PerformRecastWarpingModule",
 ]
 
 models_list = [
@@ -450,6 +480,31 @@ models_list = [
         "local_path": f"{models_dir}/liveportrait_onnx/warping_spade.onnx",
         "hash": "d6ee9af4352b47e88e0521eba6b774c48204afddc8d91c671a5f7b8a0dfb4971",
         "url": f"{assets_repo}/v0.1.0_lp/warping_spade.onnx",
+    },
+    # --- PerformRecast (expression-only "Recast" mode of the Face Expression Restorer) ---
+    {
+        "model_name": "PerformRecastAppearanceFeatureExtractor",
+        "local_path": f"{models_dir}/performrecast_onnx/appearance_feature_extractor.onnx",
+        "hash": "208e4f848b430cbfa71a36dab7ec25a5b345882f846dbb27288abcfb2ae89a96",
+        "url": "https://github.com/Glat0s/PerformRecast-onnx/releases/download/onnx-v1/appearance_feature_extractor.onnx",
+    },
+    {
+        "model_name": "PerformRecastMotionExtractor",
+        "local_path": f"{models_dir}/performrecast_onnx/motion_extractor.onnx",
+        "hash": "b1b26c1b6d7520eb8020175050f0381c4f402ccaa6afbaebee259da4ff9dcb6c",
+        "url": "https://github.com/Glat0s/PerformRecast-onnx/releases/download/onnx-v1/motion_extractor.onnx",
+    },
+    {
+        "model_name": "PerformRecastWarpingModule",
+        "local_path": f"{models_dir}/performrecast_onnx/warping_module.onnx",
+        "hash": "92d8a1414a31a4117237bbfb667be02e71831a085af6697c9c3465200228a0ce",
+        "url": "https://github.com/Glat0s/PerformRecast-onnx/releases/download/onnx-v1/warping_module.onnx",
+    },
+    {
+        "model_name": "PerformRecastSpadeGenerator",
+        "local_path": f"{models_dir}/performrecast_onnx/spade_generator.onnx",
+        "hash": "4d8127313b1c2f6b53320b65208dafc22db260550f690cfa114dec646c7a8f5f",
+        "url": "https://github.com/Glat0s/PerformRecast-onnx/releases/download/onnx-v1/spade_generator.onnx",
     },
     {
         "model_name": "RefLDMVAEEncoder",

@@ -1070,6 +1070,77 @@ def tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
     return Image.fromarray(tensor)
 
 
+def calculate_pose_disparity_weight(src_kps: np.ndarray, tgt_kps: np.ndarray) -> float:
+    """
+    Estimates the 3D pose mismatch (Yaw and Pitch) using 2D distance proxies.
+    Returns a weight between 0.0 (extreme mismatch) and 1.0 (perfect match).
+
+    Refactored to include a 'Safe Zone' to prevent penalizing natural facial
+    asymmetries, slight head turns, or mouth movements (speaking).
+    """
+    eps = 1e-5
+
+    def get_proxies(kps: np.ndarray) -> tuple[float, float]:
+        left_eye, right_eye, nose = kps[0], kps[1], kps[2]
+        left_mouth, right_mouth = kps[3], kps[4]
+
+        # Yaw Proxy: Difference in distance from nose to each eye
+        dist_left = float(np.linalg.norm(nose - left_eye))
+        dist_right = float(np.linalg.norm(nose - right_eye))
+        yaw_proxy = abs(dist_left - dist_right) / (dist_left + dist_right + eps)
+
+        # Pitch Proxy: Ratio of upper face vs lower face
+        eye_mid = (left_eye + right_eye) / 2.0
+        mouth_mid = (left_mouth + right_mouth) / 2.0
+        dist_upper = float(np.linalg.norm(nose - eye_mid))
+        dist_lower = float(np.linalg.norm(mouth_mid - nose))
+        pitch_proxy = dist_upper / (dist_lower + eps)
+
+        return yaw_proxy, pitch_proxy
+
+    src_yaw, src_pitch = get_proxies(src_kps)
+    tgt_yaw, tgt_pitch = get_proxies(tgt_kps)
+
+    yaw_diff = abs(tgt_yaw - src_yaw)
+    # Pitch is highly volatile due to mouth opening/closing.
+    # We use a relative difference to normalize it.
+    pitch_diff = abs(tgt_pitch - src_pitch) / (max(tgt_pitch, src_pitch) + eps)
+
+    # --- YAW SAFE ZONE CALCULATION ---
+    # 0.0 to 0.35: Perfectly safe (allows slight turns and natural asymmetry)
+    # 0.65+: Severe profile (kills the morph completely)
+    yaw_safe_zone = 0.35
+    yaw_max_tolerance = 0.65
+
+    if yaw_diff <= yaw_safe_zone:
+        yaw_weight = 1.0
+    else:
+        # Smooth linear decay from 1.0 to 0.0 outside the safe zone
+        yaw_weight = 1.0 - (
+            (yaw_diff - yaw_safe_zone) / (yaw_max_tolerance - yaw_safe_zone)
+        )
+
+    yaw_weight = float(np.clip(yaw_weight, 0.0, 1.0))
+
+    # --- PITCH SAFE ZONE CALCULATION ---
+    # 0.0 to 0.40: Perfectly safe (forgives mouth movements and minor nods)
+    # 0.80+: Severe vertical tilt
+    pitch_safe_zone = 0.40
+    pitch_max_tolerance = 0.80
+
+    if pitch_diff <= pitch_safe_zone:
+        pitch_weight = 1.0
+    else:
+        pitch_weight = 1.0 - (
+            (pitch_diff - pitch_safe_zone) / (pitch_max_tolerance - pitch_safe_zone)
+        )
+
+    pitch_weight = float(np.clip(pitch_weight, 0.0, 1.0))
+
+    # Return the strictest penalty to ensure structural safety of the crop
+    return min(yaw_weight, pitch_weight)
+
+
 def keypoints_adjustments(
     kps_5: np.ndarray,
     parameters: Mapping[str, Any],
@@ -1078,19 +1149,24 @@ def keypoints_adjustments(
     """
     Adjusts facial keypoints for morphing and manual alignments.
     Uses a Local Anisotropic Alignment strategy based on the eye-line.
-    Includes a safety clamp to prevent extreme axial collapse (the 'small face' bug)
-    while allowing enough natural perspective compression to prevent shoulder-bleed.
+    Includes a dynamic 3D pose-penalty to prevent affine stretching on profile shots.
     """
+    # Create a fresh copy to prevent mutating the original array in shared memory
     kps_5_adj = kps_5.copy()
 
     if (
         parameters.get("FaceKeypointsReplaceEnableToggle", False)
         and source_kps is not None
     ):
-        morph_amount = parameters.get("FaceKeypointsReplaceDecimalSlider", 0.0)
+        base_morph_amount = parameters.get("FaceKeypointsReplaceDecimalSlider", 0.0)
 
-        if morph_amount > 0.0:
-            try:
+        # Only run the complex math if the user actually requested morphing
+        if base_morph_amount > 0.0:
+            # Dynamically reduce the morph amount based on 3D pose mismatch
+            pose_weight = calculate_pose_disparity_weight(source_kps, kps_5_adj)
+            morph_amount = base_morph_amount * pose_weight
+
+            if morph_amount > 0.0:
                 # 1. Isolate Translation: Center the keypoints
                 tgt_centroid = np.mean(kps_5_adj, axis=0)
                 src_centroid = np.mean(source_kps, axis=0)
@@ -1109,16 +1185,20 @@ def keypoints_adjustments(
 
                 # 3. Rotate both faces to be perfectly upright/horizontal (Roll = 0)
                 cos_tgt, sin_tgt = np.cos(-angle_tgt), np.sin(-angle_tgt)
-                R_flat_tgt = np.array([[cos_tgt, -sin_tgt], [sin_tgt, cos_tgt]])
+                R_flat_tgt = np.array(
+                    [[cos_tgt, -sin_tgt], [sin_tgt, cos_tgt]], dtype=np.float32
+                )
                 tgt_flat = tgt_centered @ R_flat_tgt.T
 
                 cos_src, sin_src = np.cos(-angle_src), np.sin(-angle_src)
-                R_flat_src = np.array([[cos_src, -sin_src], [sin_src, cos_src]])
+                R_flat_src = np.array(
+                    [[cos_src, -sin_src], [sin_src, cos_src]], dtype=np.float32
+                )
                 src_flat = src_centered @ R_flat_src.T
 
                 # 4. Local Anisotropic Scale (Independent X and Y)
-                eps = 1e-6
-                std_tgt = np.std(tgt_flat, axis=0) + eps
+                eps = 1e-5
+                std_tgt = np.std(tgt_flat, axis=0)
                 std_src = np.std(src_flat, axis=0) + eps
 
                 scale_x = std_tgt[0] / std_src[0]
@@ -1126,18 +1206,22 @@ def keypoints_adjustments(
 
                 # Calculate the average scale to get a baseline reference for the overall face size.
                 base_scale = (scale_x + scale_y) / 2.0
+                base_scale = max(base_scale, eps)
 
-                # We allow the axis to compress (down to 30% of the baseline scale)
-                # However, we prevent it from dropping below this threshold, avoiding the "miniature face" bug.
-                scale_x = np.clip(scale_x, base_scale * 0.3, base_scale * 2.5)
-                scale_y = np.clip(scale_y, base_scale * 0.3, base_scale * 2.5)
+                # Clamp scaling strictly between 30% and 250% of the baseline to prevent collapse
+                scale_x = float(np.clip(scale_x, base_scale * 0.3, base_scale * 2.5))
+                scale_y = float(np.clip(scale_y, base_scale * 0.3, base_scale * 2.5))
 
                 # 5. Apply Independent Scaling
-                src_flat_scaled = src_flat * np.array([scale_x, scale_y])
+                src_flat_scaled = src_flat * np.array(
+                    [scale_x, scale_y], dtype=np.float32
+                )
 
                 # 6. Rotate back to the Target's original Roll angle
                 cos_inv, sin_inv = np.cos(angle_tgt), np.sin(angle_tgt)
-                R_unflat = np.array([[cos_inv, -sin_inv], [sin_inv, cos_inv]])
+                R_unflat = np.array(
+                    [[cos_inv, -sin_inv], [sin_inv, cos_inv]], dtype=np.float32
+                )
 
                 src_aligned = src_flat_scaled @ R_unflat.T
 
@@ -1149,46 +1233,51 @@ def keypoints_adjustments(
                     kps_5_adj + morph_amount * (source_kps_aligned - kps_5_adj)
                 ).astype(np.float32)
 
-            except Exception as e:
-                print(f"[WARNING] Face Keypoints Morphing bypassed: {e}")
-
     # --- MANUAL ALIGNMENTS (Sliders) ---
     if parameters.get("FaceAdjEnableToggle", False):
         # 1. Apply spatial translations (X / Y Axis)
-        # Adjusts the facial keypoints position based on user-defined offsets.
         kps_5_adj[:, 0] += parameters.get("KpsXSlider", 0.0)
         kps_5_adj[:, 1] += parameters.get("KpsYSlider", 0.0)
 
         # 2. Apply spatial scaling
-        # Resizes the face representation while maintaining its relative geometry.
         scale_val = parameters.get("KpsScaleSlider", 0.0)
         if scale_val != 0.0:
             scale_factor = 1.0 + (scale_val / 100.0)
-
-            # FW-BUG-FIX: Dynamic Centroid Calculation.
-            # Replaced the hardcoded '255' center with the actual barycenter
-            # of the face keypoints. This prevents unwanted translation (drift)
-            # when resizing faces that are not perfectly centered at (255, 255).
-            centroid = np.mean(kps_5_adj, axis=0)  # Returns array([mean_x, mean_y])
-
-            # Vectorized scaling: (Point - Centroid) * Scale + Centroid
-            # Computes both X and Y axes simultaneously for optimal NumPy performance.
+            centroid = np.mean(kps_5_adj, axis=0)
             kps_5_adj = (kps_5_adj - centroid) * scale_factor + centroid
 
+    # 3. Micro-adjustments for individual keypoints
     if (
         parameters.get("LandmarksPositionAdjEnableToggle", False)
         and kps_5_adj.shape[0] >= 5
     ):
-        kps_5_adj[0][0] += parameters["EyeLeftXAmountSlider"]
-        kps_5_adj[0][1] += parameters["EyeLeftYAmountSlider"]
-        kps_5_adj[1][0] += parameters["EyeRightXAmountSlider"]
-        kps_5_adj[1][1] += parameters["EyeRightYAmountSlider"]
-        kps_5_adj[2][0] += parameters["NoseXAmountSlider"]
-        kps_5_adj[2][1] += parameters["NoseYAmountSlider"]
-        kps_5_adj[3][0] += parameters["MouthLeftXAmountSlider"]
-        kps_5_adj[3][1] += parameters["MouthLeftYAmountSlider"]
-        kps_5_adj[4][0] += parameters["MouthRightXAmountSlider"]
-        kps_5_adj[4][1] += parameters["MouthRightYAmountSlider"]
+        offsets = np.array(
+            [
+                [
+                    parameters.get("EyeLeftXAmountSlider", 0.0),
+                    parameters.get("EyeLeftYAmountSlider", 0.0),
+                ],
+                [
+                    parameters.get("EyeRightXAmountSlider", 0.0),
+                    parameters.get("EyeRightYAmountSlider", 0.0),
+                ],
+                [
+                    parameters.get("NoseXAmountSlider", 0.0),
+                    parameters.get("NoseYAmountSlider", 0.0),
+                ],
+                [
+                    parameters.get("MouthLeftXAmountSlider", 0.0),
+                    parameters.get("MouthLeftYAmountSlider", 0.0),
+                ],
+                [
+                    parameters.get("MouthRightXAmountSlider", 0.0),
+                    parameters.get("MouthRightYAmountSlider", 0.0),
+                ],
+            ],
+            dtype=np.float32,
+        )
+
+        kps_5_adj[:5] += offsets
 
     return kps_5_adj
 

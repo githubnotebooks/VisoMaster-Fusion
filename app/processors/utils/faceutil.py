@@ -1698,6 +1698,12 @@ def warp_face_by_face_landmark_x(img, pts, **kwargs):
     dsize = kwargs.get("dsize", 224)  # Default LivePortrait size
     scale = kwargs.get("scale", 1.5)
     vy_ratio = kwargs.get("vy_ratio", -0.1)
+    # Out-of-bounds sampling fill. Defaults to "zeros" (unchanged behaviour).
+    # Callers that crop with a wide scale and/or a face near the image edge
+    # (e.g. the VR180 perspective crops fed to PerformRecast) can pass
+    # "border" to replicate edge pixels instead of producing black borders,
+    # which otherwise yield all/mostly-black face crops.
+    padding_mode = kwargs.get("padding_mode", "zeros")
 
     # Pad image if necessary
     img = pad_image_by_size(img, dsize)
@@ -1713,7 +1719,9 @@ def warp_face_by_face_landmark_x(img, pts, **kwargs):
 
     # 100% GPU Warping using Kornia
     # Bypasses the slow t = trans.SimilarityTransform() completely
-    warped_img = transform_img_kgm(img.float(), M_o2c, dsize=dsize)
+    warped_img = transform_img_kgm(
+        img.float(), M_o2c, dsize=dsize, padding_mode=padding_mode
+    )
 
     # Ensure we return the original dtype (usually uint8 or float32 depending on pipeline)
     warped_img = warped_img.to(img.dtype)
