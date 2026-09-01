@@ -33,7 +33,7 @@ class SequentialDetector:
         # Temporal state to bridge ArcFace gaps (profiles, occlusions)
         self._temporal_memory: List[Dict[str, Any]] = []
 
-    def reset_state(self):
+    def reset_state(self) -> None:
         """
         Safely clears all temporal smoothing tracking states and resets the
         underlying ByteTrack tracker. Called when seeking or loading new media.
@@ -49,10 +49,10 @@ class SequentialDetector:
         else:
             self._temporal_memory = []
 
-        if hasattr(self.main_window, "models_processor") and hasattr(
-            self.main_window.models_processor, "face_detectors"
+        if hasattr(self.main_window, "function_worker") and hasattr(
+            self.main_window.function_worker, "reset_face_tracker"
         ):
-            self.main_window.models_processor.face_detectors.reset_tracker()
+            self.main_window.function_worker.reset_face_tracker()
 
     def run(
         self,
@@ -139,6 +139,35 @@ class SequentialDetector:
         # Handle the PyTorch tensor allocation
         device = self.main_window.models_processor.device
         owns_frame_tensor = frame_tensor is None
+
+        # --- Strict Early Exit (No Targets) ---
+        # If the user hasn't clicked "Find Faces" yet and doesn't explicitly
+        # want to see bounding boxes, skip detection entirely to save VRAM.
+        try:
+            target_faces = dict(self.main_window.target_faces)
+        except Exception:
+            target_faces = {}
+
+        show_bboxes = control.get(
+            "ShowAllDetectedFacesBBoxToggle", False
+        ) or control.get("ShowByteTrackBBoxToggle", False)
+
+        if len(target_faces) == 0 and not show_bboxes:
+            if owns_frame_tensor and frame_tensor is not None:
+                del frame_tensor
+
+            # Clear smoothing states since target is lost/non-existent
+            self._smoothed_kps.clear()
+            self._smoothed_dense_kps.clear()
+            self._smoothed_dense_kps_203.clear()
+
+            return (
+                numpy.empty((0, 4), dtype=numpy.float32),
+                numpy.empty((0, 5, 2), dtype=numpy.float32),
+                numpy.empty((0, 68, 2), dtype=numpy.float32),
+                numpy.empty((0, 203, 2), dtype=numpy.float32),
+            )
+
         if frame_tensor is None:
             frame_tensor = (
                 torch.from_numpy(frame_rgb)
@@ -149,7 +178,7 @@ class SequentialDetector:
         # --- STEP 1: FAST DETECTION (BBoxes and 5-point landmarks ONLY) ---
         # CRITICAL OPTIMIZATION: Heavy landmark detection (68/203 points) is disabled here
         # to rapidly scan the crowd without burning GPU cycles.
-        bboxes, kpss_5, _ = self.main_window.models_processor.run_detect(
+        bboxes, kpss_5, _ = self.main_window.function_worker.run_detect(
             frame_tensor,
             control.get("DetectorModelSelection", "RetinaFace"),
             max_num=int(control.get("MaxFacesToDetectSlider", 20)),
@@ -191,13 +220,13 @@ class SequentialDetector:
                 current_kps5 = kpss_5[i]
 
                 # 1. Strict Identity Anchor Pass
-                face_emb, _ = self.main_window.models_processor.run_recognize_direct(
+                face_emb, _ = self.main_window.function_worker.run_recognize_direct(
                     frame_tensor, current_kps5, "Auto", rec_model
                 )
 
                 match, _, _ = find_best_target_match(
                     face_emb,
-                    self.main_window.models_processor,
+                    self.main_window.function_worker,
                     target_faces,
                     local_params_for_worker or {},
                     default_params,
@@ -221,30 +250,34 @@ class SequentialDetector:
                 and hasattr(self, "_temporal_memory")
                 and len(self._temporal_memory) > 0
             ):
-                iou_matches = []
-                for curr_idx in unverified_current_indices:
-                    curr_bbox = bboxes[curr_idx]
-                    for prev_idx, prev_data in enumerate(self._temporal_memory):
-                        prev_bbox = prev_data["bbox"]
+                # Vectorized Intersect-over-Union (IoU) Calculation using NumPy
+                curr_bboxes = bboxes[unverified_current_indices]
+                prev_bboxes = numpy.array(
+                    [p["bbox"] for p in self._temporal_memory], dtype=numpy.float32
+                )
 
-                        xA = max(curr_bbox[0], prev_bbox[0])
-                        yA = max(curr_bbox[1], prev_bbox[1])
-                        xB = min(curr_bbox[2], prev_bbox[2])
-                        yB = min(curr_bbox[3], prev_bbox[3])
+                # Broadcasting to compute intersections
+                xA = numpy.maximum(curr_bboxes[:, 0:1], prev_bboxes[:, 0])
+                yA = numpy.maximum(curr_bboxes[:, 1:2], prev_bboxes[:, 1])
+                xB = numpy.minimum(curr_bboxes[:, 2:3], prev_bboxes[:, 2])
+                yB = numpy.minimum(curr_bboxes[:, 3:4], prev_bboxes[:, 3])
 
-                        interArea = max(0.0, xB - xA) * max(0.0, yB - yA)
-                        boxAArea = (curr_bbox[2] - curr_bbox[0]) * (
-                            curr_bbox[3] - curr_bbox[1]
-                        )
-                        boxBArea = (prev_bbox[2] - prev_bbox[0]) * (
-                            prev_bbox[3] - prev_bbox[1]
-                        )
+                interArea = numpy.maximum(0.0, xB - xA) * numpy.maximum(0.0, yB - yA)
+                boxAArea = (curr_bboxes[:, 2] - curr_bboxes[:, 0]) * (
+                    curr_bboxes[:, 3] - curr_bboxes[:, 1]
+                )
+                boxBArea = (prev_bboxes[:, 2] - prev_bboxes[:, 0]) * (
+                    prev_bboxes[:, 3] - prev_bboxes[:, 1]
+                )
 
-                        denominator = float(boxAArea + boxBArea - interArea)
-                        iou = interArea / denominator if denominator > 0 else 0.0
+                denominator = boxAArea[:, None] + boxBArea - interArea
+                iou_matrix = numpy.where(denominator > 0, interArea / denominator, 0.0)
 
-                        if iou > 0.40:
-                            iou_matches.append((iou, curr_idx, prev_idx))
+                rows, cols = numpy.where(iou_matrix > 0.40)
+                iou_matches = [
+                    (float(iou_matrix[r, c]), unverified_current_indices[r], int(c))
+                    for r, c in zip(rows, cols)
+                ]
 
                 iou_matches.sort(key=lambda x: x[0], reverse=True)
                 used_curr_indices = set()
@@ -282,14 +315,21 @@ class SequentialDetector:
             self._temporal_memory = temporal_memory_this_frame
 
         elif isinstance(bboxes, numpy.ndarray) and bboxes.shape[0] > 0:
-            valid_indices = list(range(len(bboxes)))
-
-            temporal_memory_this_frame = []
-            for i in range(len(bboxes)):
-                # If no targets, we must generate dummy embeddings to keep the structure intact
-                dummy_emb = numpy.zeros((512,), dtype=numpy.float32)
-                temporal_memory_this_frame.append({"bbox": bboxes[i], "emb": dummy_emb})
-            self._temporal_memory = temporal_memory_this_frame
+            # Early Exit for No-Op Heavy Landmark Detection
+            force_swap = control.get("ForceSwapToggle", True)
+            if not force_swap and not requires_203:
+                valid_indices = []
+                self._temporal_memory = []
+            else:
+                valid_indices = list(range(len(bboxes)))
+                temporal_memory_this_frame = []
+                for i in range(len(bboxes)):
+                    # If no targets, we must generate dummy embeddings to keep the structure intact
+                    dummy_emb = numpy.zeros((512,), dtype=numpy.float32)
+                    temporal_memory_this_frame.append(
+                        {"bbox": bboxes[i], "emb": dummy_emb}
+                    )
+                self._temporal_memory = temporal_memory_this_frame
 
         # Apply the filter to eliminate background extras and non-targets
         filtered_bboxes = (
@@ -341,7 +381,7 @@ class SequentialDetector:
             # FW-LOGIC-FIX 1: Extract forced 203 landmarks FIRST if required
             if requires_203:
                 lm_203_5, lm_203, _ = (
-                    self.main_window.models_processor.run_detect_landmark(
+                    self.main_window.function_worker.run_detect_landmark(
                         frame_tensor,
                         current_bbox,
                         current_kps5,
@@ -375,7 +415,7 @@ class SequentialDetector:
                     kps_standard = kps_203_local.copy()
                 else:
                     lm_std_5, lm_kpss, _ = (
-                        self.main_window.models_processor.run_detect_landmark(
+                        self.main_window.function_worker.run_detect_landmark(
                             frame_tensor,
                             current_bbox,
                             current_kps5,

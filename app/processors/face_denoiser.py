@@ -2,7 +2,7 @@ import os
 import threading
 import gc
 import traceback
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional, Union
 from collections import OrderedDict
 
 import torch
@@ -11,9 +11,11 @@ from torchvision.transforms import v2
 
 if TYPE_CHECKING:
     from app.processors.models_processor import ModelsProcessor
+    from app.processors.workers.function_worker import FunctionWorker
     from PIL import Image
 
 from app.processors.utils import faceutil
+from app.processors.utils import platform_support
 from app.helpers.miscellaneous import is_file_exists
 from app.helpers.downloader import download_file
 from app.processors.utils.ref_ldm_kv_embedding import KVExtractor
@@ -25,8 +27,13 @@ class FaceDenoiser:
     Manages DDIM/DDPM mathematical schedules and VAE latent processing.
     """
 
-    def __init__(self, models_processor: "ModelsProcessor"):
+    def __init__(
+        self,
+        models_processor: "ModelsProcessor",
+        function_worker: "FunctionWorker",
+    ):
         self.models_processor = models_processor
+        self.function_worker = function_worker
 
         # --- KV Extractor State ---
         self.kv_extractor: Optional[KVExtractor] = None
@@ -177,11 +184,13 @@ class FaceDenoiser:
     def extract_into_tensor_torch(
         a: torch.Tensor, t: torch.Tensor, x_shape: tuple
     ) -> torch.Tensor:
+        # Direct indexing is significantly faster than torch.gather for 1D arrays.
+        # .view() maps the memory without allocating a new tensor.
         if t.ndim == 0:
             t = t.unsqueeze(0)
         b = t.shape[0]
-        out = torch.gather(a, 0, t.long())
-        return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+        out = a[t.long()]
+        return out.view(b, *((1,) * (len(x_shape) - 1)))
 
     def ensure_denoiser_models_loaded(self):
         """Loads the UNet and VAE models if they are not already loaded."""
@@ -215,11 +224,14 @@ class FaceDenoiser:
             self.models_processor.unload_model("RefLDMVAEEncoder")
             self.models_processor.unload_model("RefLDMVAEDecoder")
 
+    @torch.no_grad()
     def get_kv_map_for_face(
-        self, input_face_image_pil: "Image.Image", unload_after: bool = True
+        self,
+        image: Union["Image.Image", torch.Tensor],
+        unload_after: bool = True,
     ) -> Dict[str, Dict[str, torch.Tensor]]:
         """
-        Loads the KV Extractor, extracts K/V maps, and unloads (if unload_after is True).
+        Loads the KV Extractor, extracts K/V maps for a single image, and unloads (if requested).
         Callers are responsible for holding kv_extraction_lock around this call.
         """
         kv_map = {}
@@ -232,13 +244,16 @@ class FaceDenoiser:
 
             # 2. Perform the extraction
             print("[INFO] Extracting K/V from reference image...")
-            kv_map = self.kv_extractor.extract_kv(input_face_image_pil)
+            kv_map = self.kv_extractor.extract_kv(image)
+
             print(
                 f"[INFO] Successfully extracted K/V for {len(kv_map)} attention layers."
             )
 
         except Exception as e:
             print(f"[ERROR] Failed the K/V extraction: {e}")
+            import traceback
+
             traceback.print_exc()
             kv_map = {}  # Return empty map if failed
 
@@ -335,6 +350,7 @@ class FaceDenoiser:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
+    @torch.no_grad()
     def apply_denoiser_unet(
         self,
         image_cxhxw_uint8: torch.Tensor,
@@ -347,22 +363,19 @@ class FaceDenoiser:
         denoiser_ddim_eta: float = 0.0,
         base_seed: int = 220,
         latent_sharpening_strength: float = 0.0,
-        color_transfer: int = 100,
-        color_transfer_mode: str = "Reinhard Transfer (Masked)",
+        enable_color_correction: bool = True,
         color_mask: torch.Tensor | None = None,
-        blend_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Runs the Diffusion-based Denoiser/Restorer (ReF-LDM).
         Supports 'Single Step' (Fast) and 'Full Restore' (DDIM) modes.
-        Also handles pixel sharpening and histogram matching for color consistency.
+        Handles pixel sharpening and optional Reinhard masked color anchor.
         """
         # --- CONFIGURATION ---
         ENABLE_PIXEL_SHARPENING = latent_sharpening_strength > 0.0
         PIXEL_SHARPEN_STRENGTH = latent_sharpening_strength
 
-        ENABLE_COLOR_MATCH = color_transfer > 0
-        COLOR_STRENGTH = color_transfer
+        ENABLE_COLOR_MATCH = enable_color_correction
 
         # P2-04: enable debug output via env var: set VISOMASTER_DEBUG_DENOISER=1
         DEBUG_DENOISER = os.environ.get("VISOMASTER_DEBUG_DENOISER", "0") == "1"
@@ -437,10 +450,16 @@ class FaceDenoiser:
             image_to_process_cxhxw_uint8.shape[2],
         )
 
-        image_srgb_float_minus1_1 = (image_to_process_cxhxw_uint8.float() / 127.5) - 1.0
-        image_srgb_float_minus1_1_batched = image_srgb_float_minus1_1.unsqueeze(
-            0
-        ).contiguous()
+        # Fused in-place math and non-blocking transfer
+        image_srgb_float_minus1_1_batched = (
+            image_to_process_cxhxw_uint8.to(
+                dtype=torch.float32, copy=True, non_blocking=True
+            )
+            .mul_(1.0 / 127.5)
+            .sub_(1.0)
+            .unsqueeze(0)
+            .contiguous()
+        )
 
         latent_h, latent_w = h_proc // 8, w_proc // 8
         encoded_latent_direct_vae_out_bchw = torch.empty(
@@ -449,7 +468,7 @@ class FaceDenoiser:
             device=self.models_processor.device,
         ).contiguous()
 
-        self.models_processor.face_restorers.run_vae_encoder(
+        self.function_worker.run_vae_encoder(
             image_srgb_float_minus1_1_batched, encoded_latent_direct_vae_out_bchw
         )
 
@@ -490,29 +509,17 @@ class FaceDenoiser:
             current_t_idx = min(
                 max(0, denoiser_single_step_t), len(self.alphas_cumprod_np) - 1
             )
-            alpha_t_bar_val = self.alphas_cumprod_np[current_t_idx]
+            alpha_t_bar_val = float(self.alphas_cumprod_np[current_t_idx])
 
-            sqrt_alpha_bar_t_torch = torch.sqrt(
-                torch.full(
-                    (1,),
-                    alpha_t_bar_val,
-                    dtype=torch.float32,
-                    device=self.models_processor.device,
-                )
-            )
-            sqrt_one_minus_alpha_bar_t_torch = torch.sqrt(
-                1.0
-                - torch.full(
-                    (1,),
-                    alpha_t_bar_val,
-                    dtype=torch.float32,
-                    device=self.models_processor.device,
-                )
-            )
+            # Calculate scalars on CPU and let PyTorch broadcast them in C++.
+            # Eliminates torch.full() allocations.
+            import math
+
+            sqrt_a = math.sqrt(alpha_t_bar_val)
+            sqrt_one_minus_a = math.sqrt(1.0 - alpha_t_bar_val)
 
             xt_noisy_scaled_8_channel = (
-                lq_latent_x0_scaled_for_unet * sqrt_alpha_bar_t_torch
-                + noise_sample * sqrt_one_minus_alpha_bar_t_torch
+                lq_latent_x0_scaled_for_unet * sqrt_a + noise_sample * sqrt_one_minus_a
             )
             unet_input_16_channel = torch.cat(
                 (xt_noisy_scaled_8_channel, lq_latent_x0_scaled_for_unet), dim=1
@@ -532,9 +539,9 @@ class FaceDenoiser:
             ).contiguous()
 
             if torch.cuda.is_available():
-                torch.cuda.current_stream().synchronize()
+                platform_support.blocking_stream_sync()
 
-            self.models_processor.face_restorers.run_ref_ldm_unet(
+            self.function_worker.run_ref_ldm_unet(
                 x_noisy_plus_lq_latent=unet_input_16_channel,
                 timesteps_tensor=timesteps_tensor_unet,
                 is_ref_flag_tensor=is_ref_flag_tensor_for_unet,
@@ -543,9 +550,8 @@ class FaceDenoiser:
                 output_unet_tensor=predicted_noise_from_unet,
             )
             final_denoised_latent_x0_scaled = (
-                xt_noisy_scaled_8_channel
-                - sqrt_one_minus_alpha_bar_t_torch * predicted_noise_from_unet
-            ) / sqrt_alpha_bar_t_torch
+                xt_noisy_scaled_8_channel - sqrt_one_minus_a * predicted_noise_from_unet
+            ) / sqrt_a
 
         # --- PROCESS: Full Restore (DDIM) ---
         elif denoiser_mode == "Full Restore (DDIM)":
@@ -586,6 +592,16 @@ class FaceDenoiser:
                 torch.clamp(1.0 - ddim_alphas, min=0.0)
             )
 
+            # --- OPTIMIZATION: Pre-view schedule tensors for O(1) direct indexing ---
+            # We reshape to (N, 1, 1, 1) so PyTorch automatically broadcasts to (1, 8, H, W)
+            view_shape = (-1, 1, 1, 1)
+            ddim_alphas_view = ddim_alphas.view(view_shape)
+            ddim_alphas_prev_view = ddim_alphas_prev.view(view_shape)
+            ddim_sigmas_view = ddim_sigmas.view(view_shape)
+            ddim_sqrt_one_minus_alphas_view = ddim_sqrt_one_minus_alphas.view(
+                view_shape
+            )
+
             current_latent_xt_scaled = torch.randn(
                 lq_latent_x0_scaled_for_unet.shape,
                 device=self.models_processor.device,
@@ -599,9 +615,6 @@ class FaceDenoiser:
 
             ts_unet = torch.empty(
                 (1,), dtype=torch.int64, device=self.models_processor.device
-            )
-            schedule_idx_tensor = torch.empty(
-                (1,), dtype=torch.long, device=self.models_processor.device
             )
             e_t_cond = torch.empty_like(lq_latent_x0_scaled_for_unet)
             e_t_uncond = (
@@ -625,16 +638,14 @@ class FaceDenoiser:
                 index_for_schedules = total_steps - 1 - i
 
                 ts_unet.fill_(step_ddpm_idx)
-                schedule_idx_tensor.fill_(index_for_schedules)
 
                 # Update only the dynamic noisy channels (0-7) in-place.
-                # No more torch.cat memory fragmentation inside the loop.
                 unet_input_16_channel[:, :8] = current_latent_xt_scaled
 
                 if torch.cuda.is_available():
-                    torch.cuda.current_stream().synchronize()
+                    platform_support.blocking_stream_sync()
 
-                self.models_processor.face_restorers.run_ref_ldm_unet(
+                self.function_worker.run_ref_ldm_unet(
                     x_noisy_plus_lq_latent=unet_input_16_channel,
                     timesteps_tensor=ts_unet,
                     is_ref_flag_tensor=is_ref_flag_tensor_for_unet,
@@ -645,11 +656,10 @@ class FaceDenoiser:
 
                 if denoiser_cfg_scale != 1.0:
                     if torch.cuda.is_available():
-                        torch.cuda.current_stream().synchronize()
+                        platform_support.blocking_stream_sync()
 
                     # We re-use unet_input_16_channel directly.
-                    # It contains the exact same data needed for the uncond pass.
-                    self.models_processor.face_restorers.run_ref_ldm_unet(
+                    self.function_worker.run_ref_ldm_unet(
                         x_noisy_plus_lq_latent=unet_input_16_channel,
                         timesteps_tensor=ts_unet,
                         is_ref_flag_tensor=is_ref_flag_tensor_for_unet,
@@ -658,7 +668,6 @@ class FaceDenoiser:
                         output_unet_tensor=e_t_uncond,
                     )
                     # In-place CFG math to save memory overhead
-                    # Formula: e_t = e_t_uncond + denoiser_cfg_scale * (e_t_cond - e_t_uncond)
                     e_t = (
                         e_t_cond.sub_(e_t_uncond)
                         .mul_(denoiser_cfg_scale)
@@ -667,22 +676,13 @@ class FaceDenoiser:
                 else:
                     e_t = e_t_cond
 
-                a_t = self.extract_into_tensor_torch(
-                    ddim_alphas, schedule_idx_tensor, current_latent_xt_scaled.shape
-                )
-                a_prev = self.extract_into_tensor_torch(
-                    ddim_alphas_prev,
-                    schedule_idx_tensor,
-                    current_latent_xt_scaled.shape,
-                )
-                sigma_t = self.extract_into_tensor_torch(
-                    ddim_sigmas, schedule_idx_tensor, current_latent_xt_scaled.shape
-                )
-                sqrt_one_minus_a_t = self.extract_into_tensor_torch(
-                    ddim_sqrt_one_minus_alphas,
-                    schedule_idx_tensor,
-                    current_latent_xt_scaled.shape,
-                )
+                # --- OPTIMIZATION: Direct indexing replaces extract_into_tensor_torch ---
+                a_t = ddim_alphas_view[index_for_schedules]
+                a_prev = ddim_alphas_prev_view[index_for_schedules]
+                sigma_t = ddim_sigmas_view[index_for_schedules]
+                sqrt_one_minus_a_t = ddim_sqrt_one_minus_alphas_view[
+                    index_for_schedules
+                ]
 
                 pred_x0_scaled_current_step = (
                     current_latent_xt_scaled - sqrt_one_minus_a_t * e_t
@@ -719,18 +719,19 @@ class FaceDenoiser:
             device=self.models_processor.device,
         ).contiguous()
 
-        self.models_processor.face_restorers.run_vae_decoder(
+        self.function_worker.run_vae_decoder(
             latent_for_vae_decoder, decoded_image_normalized_bchw
         )
         del latent_for_vae_decoder
 
-        decoded_image_soft_clamped_bchw = torch.tanh(decoded_image_normalized_bchw)
-        del decoded_image_normalized_bchw
+        # Use in-place tanh_() on the pre-allocated output buffer,
+        # then chain in-place math to reach [0, 1] without creating temp tensors.
+        decoded_image_normalized_bchw.tanh_()
         image_after_postproc_float_0_1 = (
-            decoded_image_soft_clamped_bchw.squeeze(0) + 1.0
-        ) / 2.0
-        image_after_postproc_float_0_1 = torch.clamp(
-            image_after_postproc_float_0_1, 0.0, 1.0
+            decoded_image_normalized_bchw.squeeze(0)
+            .add_(1.0)
+            .mul_(0.5)
+            .clamp_(0.0, 1.0)
         )
 
         # --- COLOR MATCHING BLOCK ---
@@ -756,35 +757,11 @@ class FaceDenoiser:
                 mask = (ref_tensor.sum(dim=0) > 0).float()
 
             try:
-                if color_transfer_mode == "CDF Histogram":
-                    matched_result = faceutil.histogram_matching(
-                        ref_tensor, res_tensor, float(COLOR_STRENGTH)
-                    )
-                elif color_transfer_mode == "CDF Histogram (Masked)":
-                    matched_result = faceutil.histogram_matching_withmask(
-                        ref_tensor, res_tensor, mask, float(COLOR_STRENGTH)
-                    )
-                elif color_transfer_mode == "Reinhard Transfer":
-                    matched_result = faceutil.apply_reinhard_color_transfer(
-                        ref_tensor, res_tensor, float(COLOR_STRENGTH), mask=None
-                    )
-                elif color_transfer_mode == "Reinhard Transfer (Masked)":
-                    matched_result = faceutil.apply_reinhard_color_transfer(
-                        ref_tensor, res_tensor, float(COLOR_STRENGTH), mask
-                    )
-                elif color_transfer_mode == "AdaIN (Core Masked)":
-                    # For AdaIN: source and target are swapped so the generated face (res_tensor)
-                    # matches the statistics of the raw input face (ref_tensor)
-                    matched_result = faceutil.apply_adain_color_transfer(
-                        res_tensor,
-                        ref_tensor,
-                        mask if blend_mask is None else blend_mask,
-                        blend_amount=float(COLOR_STRENGTH),
-                        calc_mask=mask,
-                    )
-                else:
-                    matched_result = res_tensor
-
+                # Fast, lightweight Reinhard statistical transfer in LAB space.
+                # Locked to 100% blend strength using the facial region mask.
+                matched_result = faceutil.apply_reinhard_color_transfer(
+                    ref_tensor, res_tensor, 100.0, mask
+                )
                 image_after_postproc_float_0_1 = matched_result / 255.0
 
             except Exception as e:

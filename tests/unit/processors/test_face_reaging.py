@@ -69,7 +69,7 @@ def _make_onnx_session(delta_value: float = 0.0) -> MagicMock:
 def _make_reaging(delta: float = 0.0) -> FaceReaging:
     session = _make_onnx_session(delta)
     proc = _FakeModelsProcessor(session)
-    return FaceReaging(proc)  # type: ignore[arg-type]
+    return FaceReaging(proc, None)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +143,7 @@ class TestFaceReagingDtypeGuard:
     def test_none_session_returns_original_input(self):
         """When model cannot be loaded, original tensor is returned unchanged."""
         proc = _FakeModelsProcessor(None)  # load_model returns None
-        reaging = FaceReaging(proc)
+        reaging = FaceReaging(proc, None)  # type: ignore[arg-type]
         face = torch.randint(0, 256, (3, 64, 64), dtype=torch.uint8)
         result = reaging.apply_reaging(face, source_age=25, target_age=50)
         assert torch.equal(result, face)

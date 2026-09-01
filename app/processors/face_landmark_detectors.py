@@ -1,6 +1,6 @@
 import threading
 from itertools import product as product
-from typing import TYPE_CHECKING, List, Dict, Optional
+from typing import TYPE_CHECKING, List, Dict, Optional, Any, Callable
 import pickle
 
 import torch
@@ -9,6 +9,7 @@ from torchvision.transforms import v2
 
 if TYPE_CHECKING:
     from app.processors.models_processor import ModelsProcessor
+    from app.processors.workers.function_worker import FunctionWorker
 from app.processors.models_data import models_dir
 from app.processors.utils import faceutil
 
@@ -143,15 +144,22 @@ class FaceLandmarkDetectors:
         # emptied by the per-model remove() calls in the loop above; no extra
         # .clear() is needed here.
 
-    def __init__(self, models_processor: "ModelsProcessor"):
+    def __init__(
+        self,
+        models_processor: "ModelsProcessor",
+        function_worker: "FunctionWorker",
+    ):
         """
         Initializes the FaceLandmarkDetectors.
 
         Args:
             models_processor (ModelsProcessor): A reference to the main ModelsProcessor instance
                                                 which handles model loading and device management.
+            function_worker (FunctionWorker): The central FunctionWorker instance. Passed to sub-processors
+                                              so they can route calls through this Facade.
         """
         self.models_processor = models_processor
+        self.function_worker = function_worker
         self.active_landmark_models: set[str] = set()
         self.current_landmark_model_name: Optional[str] = None
         # Caches for model-specific data to avoid re-computation.
@@ -166,7 +174,7 @@ class FaceLandmarkDetectors:
         # A dictionary to map a string identifier (e.g., '68') to the corresponding
         # model name and the specific function that processes its output.
         # This makes the class easily extensible with new landmark detectors.
-        self.detector_map = {
+        self.detector_map: Dict[str, Dict[str, Any]] = {
             "5": {
                 "model_name": "FaceLandmark5",
                 "function": self.detect_face_landmark_5,
@@ -195,24 +203,39 @@ class FaceLandmarkDetectors:
                 "model_name": "FaceLandmark478",
                 "function": self.detect_face_landmark_478,
             },
+            "tufa98": {
+                "model_name": "FaceLandmarkTUFA98",
+                "function": self.detect_face_landmark_tufa98,
+            },
+            "orformer98": {
+                "model_name": "FaceLandmarkORFormer98",
+                "function": self.detect_face_landmark_orformer98,
+            },
+            "tufa314": {
+                "model_name": "FaceLandmarkTUFA314",
+                "function": self.detect_face_landmark_tufa314,
+            },
         }
 
+    @torch.no_grad()
     def run_detect_landmark(
         self,
-        img,
-        bbox,
-        det_kpss,
-        detect_mode="203",
-        score=0.5,
-        from_points=False,
-        **kwargs,
-    ):
+        img: torch.Tensor,
+        bbox: np.ndarray,
+        det_kpss: np.ndarray | None,
+        detect_mode: str = "203",
+        score: float = 0.5,
+        from_points: bool = False,
+        **kwargs: dict,
+    ) -> tuple[np.ndarray | list, np.ndarray | list, np.ndarray | list]:
         """
         Main dispatcher function to run a specific landmark detector.
         It handles model loading, caching, and calling the correct processing function.
         Accepts **kwargs to pass optional parameters like 'use_mean_eyes' to detectors.
         """
-        kpss_5, kpss, scores = [], [], []
+        kpss_5: list = []
+        kpss: list = []
+        scores: list = []
 
         # Look up the detector information from the map.
         detector_info = self.detector_map.get(detect_mode)
@@ -220,8 +243,8 @@ class FaceLandmarkDetectors:
             print(f"[WARN] Landmark detector mode '{detect_mode}' not found.")
             return kpss_5, kpss, scores
 
-        model_name = detector_info["model_name"]
-        detection_function = detector_info["function"]
+        model_name: str = str(detector_info.get("model_name", ""))
+        detection_function: Callable = detector_info["function"]
 
         # Load model if it is not already loaded.
         loaded_model_instance = self.models_processor.models.get(model_name)
@@ -278,7 +301,11 @@ class FaceLandmarkDetectors:
         if has_result:
             # FW-BUG-FIX: Exclude '478' from the threshold filter because its 'scores'
             # are actually 52 BlendShape values (expressions), not a detection confidence!
-            if has_scores and detect_mode not in ["478"]:
+            # 'orformer98' is excluded for the same class of reason: its scores are
+            # per-point visibility derived from ORFormer's internal codebook blend
+            # weight, which hovers near 0.5 even on a clean, fully visible face. Passing
+            # it through the threshold would reject good faces at any slider above ~50.
+            if has_scores and detect_mode not in ["478", "orformer98"]:
                 # If the model supports scoring (e.g., 5, 68, 98), we apply the threshold filter.
                 if np.mean(scores) >= score:
                     return kpss_5, kpss, scores
@@ -293,7 +320,7 @@ class FaceLandmarkDetectors:
 
         return [], [], []
 
-    def _ensure_landmark_5_anchors(self):
+    def _ensure_landmark_5_anchors(self) -> None:
         """
         Initializes the anchors for the FaceLandmark5 model.
         This complex calculation is performed only once and the result is cached for efficiency.
@@ -335,15 +362,15 @@ class FaceLandmarkDetectors:
 
     def _prepare_crop(
         self,
-        img,
-        bbox,
-        det_kpss,
-        from_points,
-        target_size,
-        warp_mode=None,
-        scale=1.5,
-        vy_ratio=0.0,
-    ):
+        img: torch.Tensor,
+        bbox: np.ndarray,
+        det_kpss: np.ndarray | None,
+        from_points: bool,
+        target_size: int,
+        warp_mode: str | None = None,
+        scale: float = 1.5,
+        vy_ratio: float = 0.0,
+    ) -> tuple[torch.Tensor | None, np.ndarray | None, np.ndarray | None]:
         """
         Prepares a cropped and warped face image for a landmark detector.
         This helper centralizes the repetitive pre-processing logic of aligning a face
@@ -457,23 +484,8 @@ class FaceLandmarkDetectors:
             )
 
         try:
-            # PRE-INFERENCE SYNC: Ensure PyTorch has finished preparing the memory
-            # before ONNX Runtime starts reading from the IOBinding pointers.
-            if self.models_processor.device_type == "cuda":
-                torch.cuda.current_stream().synchronize()
-            elif self.models_processor.device_type != "cpu":
-                self.models_processor.syncvec.cpu()
-
             # Run inference
-            model.run_with_iobinding(io_binding)
-
-            # POST-INFERENCE SYNC : Ensure the GPU has completed all
-            # calculations before ONNX Runtime attempts to copy the result back to CPU RAM.
-            # Without this, copy_outputs_to_cpu() might grab an incomplete tensor.
-            if self.models_processor.device_type == "cuda":
-                torch.cuda.current_stream().synchronize()
-            elif self.models_processor.device_type != "cpu":
-                self.models_processor.syncvec.cpu()
+            self.function_worker.run_ort_with_iobinding(model, io_binding)
 
             # Copy results back to CPU safely
             net_outs = io_binding.copy_outputs_to_cpu()
@@ -869,3 +881,129 @@ class FaceLandmarkDetectors:
             )
             return landmark_5, landmark, landmark_score
         return [], [], []
+
+    def _prepare_upright_square_crop(
+        self,
+        img: torch.Tensor,
+        bbox: np.ndarray,
+        det_kpss: np.ndarray | None,
+        crop_scale: float,
+    ) -> tuple[torch.Tensor | None, np.ndarray | None]:
+        """
+        Crop for TUFA / ORFormer: an upright square of side ``crop_scale * max(w, h)``
+        centred on the bbox centre, resized to 256.
+
+        Both models were trained on exactly this shape of crop (TUFA:
+        ``utils/Detector.py:crop_img``, 1.15x the detector box; ORFormer:
+        ``Dataloader/heatmapDataset.py`` + ``cfg.WFLW.FRACTION``, 1.20x the landmark
+        box). Neither has ever seen a 5-point similarity warp onto a frontal ArcFace
+        template, so the ``from_points`` path is deliberately not used for them — the
+        caller's flag is ignored rather than silently producing an out-of-distribution
+        crop. See onnx-export-notes.md §4.
+
+        Roll correction from the eye keypoints IS kept (``_prepare_crop`` does this for
+        the bbox path): both models trained with +-15 deg rotation augmentation, so
+        uprighting keeps the face inside that range, whereas a heavily rolled face
+        would be far outside it.
+        """
+        aimg, _M, IM = self._prepare_crop(
+            img,
+            bbox,
+            det_kpss,
+            from_points=False,
+            target_size=256,
+            scale=crop_scale,
+        )
+        if aimg is None:
+            return None, None
+        # Both graphs fold ImageNet normalisation internally and expect RGB in [0, 1].
+        aimg = torch.div(aimg.to(dtype=torch.float32), 255.0).unsqueeze(0).contiguous()
+        return aimg, IM
+
+    def detect_face_landmark_tufa98(
+        self, img, bbox, det_kpss, from_points=False, **kwargs
+    ):
+        """TUFA, 98-point WFLW topology. Output is normalised, hence the * 256.0."""
+        aimg, IM = self._prepare_upright_square_crop(img, bbox, det_kpss, 1.15)
+        if aimg is None:
+            return [], [], []
+
+        net_outs = self._run_onnx_binding(
+            "FaceLandmarkTUFA98", {"image": aimg}, ["landmarks"]
+        )
+        if not net_outs or len(net_outs) < 1:
+            return [], [], []
+
+        pred = net_outs[0].reshape((-1, 2)) * 256.0
+        pred = faceutil.trans_points2d(pred, IM)
+
+        # TUFA emits no per-point confidence, so scores stay empty and
+        # run_detect_landmark passes the result through (same as 106 / 203). The
+        # converter still requires a score array positionally, hence the zeros.
+        landmark_5, _ = faceutil.convert_face_landmark_98_to_5(pred, np.zeros(98))
+        return landmark_5, pred, []
+
+    def detect_face_landmark_tufa314(
+        self, img, bbox, det_kpss, from_points=False, **kwargs
+    ):
+        """
+        TUFA, dense 314-point topology. Same weights and same crop as tufa98 — only the
+        structure prompt baked into the graph differs — so the * 256.0 denormalisation,
+        the 1.15 crop scale and the "no confidence head" behaviour all carry over.
+        """
+        aimg, IM = self._prepare_upright_square_crop(img, bbox, det_kpss, 1.15)
+        if aimg is None:
+            return [], [], []
+
+        net_outs = self._run_onnx_binding(
+            "FaceLandmarkTUFA314", {"image": aimg}, ["landmarks"]
+        )
+        if not net_outs or len(net_outs) < 1:
+            return [], [], []
+
+        pred = net_outs[0].reshape((-1, 2)) * 256.0
+        pred = faceutil.trans_points2d(pred, IM)
+
+        landmark_5, _ = faceutil.convert_face_landmark_314_to_5(pred, np.zeros(314))
+        return landmark_5, pred, []
+
+    def detect_face_landmark_orformer98(
+        self, img, bbox, det_kpss, from_points=False, **kwargs
+    ):
+        """
+        ORFormer, 98-point WFLW topology. Output is already in 256-crop pixels.
+
+        The second output is ORFormer's per-patch occlusion score on a 16x16 latent
+        grid (each cell = 16x16 px of the crop). It is sampled at each landmark and
+        returned as ``1 - occlusion`` in the scores slot, giving the per-point
+        visibility signal none of the other landmark models provide.
+
+        Caveat that drives the exclusions in run_detect_landmark and
+        FaceDetectors._refine_landmarks: this value is ORFormer's internal codebook
+        BLEND WEIGHT, not a calibrated detection confidence. It sits near 0.5 even on a
+        clean, fully visible face, so it must never be compared against the user's
+        score threshold or against a detector confidence — only against other points on
+        the same face.
+        """
+        aimg, IM = self._prepare_upright_square_crop(img, bbox, det_kpss, 1.20)
+        if aimg is None:
+            return [], [], []
+
+        net_outs = self._run_onnx_binding(
+            "FaceLandmarkORFormer98", {"image": aimg}, ["landmarks", "occlusion"]
+        )
+        if not net_outs or len(net_outs) < 2:
+            return [], [], []
+
+        pred = net_outs[0].reshape((-1, 2))  # already crop pixels
+        occlusion = net_outs[1].reshape(16, 16)
+
+        # Sample visibility in CROP space, before mapping the points back.
+        cell = 256.0 / 16.0
+        gx = np.clip((pred[:, 0] / cell).astype(np.int32), 0, 15)
+        gy = np.clip((pred[:, 1] / cell).astype(np.int32), 0, 15)
+        visibility = (1.0 - occlusion[gy, gx]).astype(np.float32)
+
+        pred = faceutil.trans_points2d(pred, IM)
+        landmark_5, _ = faceutil.convert_face_landmark_98_to_5(pred, visibility)
+        return landmark_5, pred, visibility
