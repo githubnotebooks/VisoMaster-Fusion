@@ -141,6 +141,9 @@
               expat
               libiconv
               dbus
+              krb5
+              brotli
+              libpulseaudio
             ];
 
             # 图形/数学库
@@ -287,6 +290,8 @@
               export LD_LIBRARY_PATH=/run/opengl-driver/lib:$LD_LIBRARY_PATH
               # 添加系统 opencv4Full 到 PYTHONPATH（优先于 venv，有 AV1 支持）
               export PYTHONPATH=${pkgs.v2511.python312Packages.opencv4Full}/lib/python3.12/site-packages:$PYTHONPATH
+              # 防止 PySide6 加载系统的 Qt 插件（libqgtk3 会引入 GTK 文件对话框并崩溃）
+              unset QT_PLUGIN_PATH
             '';
 
             env.LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath allLibraries;
